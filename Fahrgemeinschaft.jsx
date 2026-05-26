@@ -587,7 +587,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, color: C.textDim }}>
                     {dayDriver.solo
-                      ? "Solo gefahren · nicht gewertet"
+                      ? "Hat gefahren · solo (nicht gewertet)"
                       : dayDriver.source === "logged"
                       ? "Hat gefahren"
                       : dayDriver.isSubstitute
@@ -836,7 +836,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                 <Car size={14} />
                 {trip.driverId
                   ? (trip.solo
-                      ? "Solo · nicht gewertet"
+                      ? "Gefahren · Solo"
                       : state.weeklyAssignments?.[currentWeekKey] === trip.driverId
                       ? "Wochenfahrer"
                       : "Heute gefahren")
@@ -851,7 +851,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                       {driver.name}
                     </div>
                     <div style={{ fontSize: 13, color: C.textDim, marginTop: 4 }}>
-                      {trip.driverId ? (trip.solo ? "ist heute solo gefahren" : "fährt heute")
+                      {trip.driverId ? (trip.solo ? "ist heute gefahren · solo" : "fährt heute")
                         : dayDriver.isSubstitute ? "übernimmt für " + (state.members.find((m) => m.id === dayDriver.originalDriverId)?.name || "Wochenfahrer")
                         : "ist als Nächste·r dran"}
                     </div>
@@ -899,7 +899,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                     </div>
                     <div style={{ fontSize: 12, color: C.textDim, marginTop: 2 }}>
                       {isPending ? <span style={{ color: C.amber }}>Wann fährt {m.name}?</span>
-                        : isDriver ? (trip.solo ? "🚗 solo (nicht gewertet)" : "🚗 fährt")
+                        : isDriver ? (trip.solo ? "🚗 gefahren · solo (nicht gewertet)" : "🚗 fährt")
                         : status === "rode" ? "🚙 mitgefahren"
                         : status === "sick" ? "🤒 krank"
                         : status === "vacation" ? "✈️ Urlaub"
@@ -1045,11 +1045,18 @@ function WeekView({ state, setState, today }) {
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <Avatar member={driver} size={28} />
                     <div style={{ minWidth: 0, flex: 1 }}>
-                      <div style={{ color: C.text, fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {driver.name}
+                      <div style={{ color: C.text, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{driver.name}</span>
+                        {dayDr.solo && (
+                          <span style={{
+                            fontSize: 9, fontFamily: FONT_MONO, color: C.textDim,
+                            border: `1px solid ${C.border}`, padding: "1px 5px", borderRadius: 3,
+                            letterSpacing: "0.1em", flexShrink: 0,
+                          }}>SOLO</span>
+                        )}
                       </div>
-                      <div style={{ fontSize: 11, color: dayDr.solo ? C.textFaint : dayDr.isSubstitute ? C.blue : C.textDim }}>
-                        {dayDr.solo ? "solo · nicht gewertet"
+                      <div style={{ fontSize: 11, color: dayDr.isSubstitute && !dayDr.solo ? C.blue : C.textDim }}>
+                        {dayDr.solo ? "ist gefahren · nicht gewertet"
                           : dayDr.source === "logged" ? "ist gefahren"
                           : dayDr.isSubstitute ? "Vertretung"
                           : "Vorschlag"}
