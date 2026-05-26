@@ -228,14 +228,14 @@ async function loadLegacy() {
 function daysDrivenCount(memberId, state) {
   let n = 0;
   Object.values(state.trips).forEach((t) => {
-    if (t.driverId === memberId) n++;
+    if (t.driverId === memberId && !t.solo) n++;
   });
   return n;
 }
 function weeksDrivenCount(memberId, state) {
   const weeks = new Set();
   Object.entries(state.trips).forEach(([date, trip]) => {
-    if (trip.driverId === memberId) {
+    if (trip.driverId === memberId && !trip.solo) {
       weeks.add(ymd(startOfWeek(parseYmd(date))));
     }
   });
@@ -280,7 +280,7 @@ function getWeekDriver(state, weekStart) {
     const d = addDays(weekStart, i);
     if (!isCommuteDay(d)) continue;
     const trip = state.trips[ymd(d)];
-    if (trip?.driverId) return { id: trip.driverId, source: "logged" };
+    if (trip?.driverId && !trip.solo) return { id: trip.driverId, source: "logged" };
   }
   // 3. Projektion
   if (state.members.length === 0) return null;
@@ -293,7 +293,7 @@ function getWeekDriver(state, weekStart) {
     driverWeeks[m.id] = new Set();
   });
   Object.entries(state.trips).forEach(([date, trip]) => {
-    if (trip.driverId && driverWeeks[trip.driverId]) {
+    if (trip.driverId && !trip.solo && driverWeeks[trip.driverId]) {
       driverWeeks[trip.driverId].add(ymd(startOfWeek(parseYmd(date))));
     }
   });
@@ -324,7 +324,7 @@ function getWeekDriver(state, weekStart) {
         const d = addDays(cursor, i);
         if (!isCommuteDay(d)) continue;
         const trip = state.trips[ymd(d)];
-        if (trip?.driverId) { projectedId = trip.driverId; break; }
+        if (trip?.driverId && !trip.solo) { projectedId = trip.driverId; break; }
       }
       if (!projectedId) {
         const w = pickWinner(state, cursor, counts);
@@ -349,7 +349,7 @@ function computeDayDriver(state, date) {
   const dateKey = ymd(date);
   const trip = state.trips[dateKey];
   // Schon protokolliert
-  if (trip?.driverId) return { id: trip.driverId, source: "logged", isSubstitute: false };
+  if (trip?.driverId) return { id: trip.driverId, source: "logged", isSubstitute: false, solo: !!trip.solo };
 
   // Wochenfahrer (jetzt mit Projektion)
   const wk = getWeekDriver(state, startOfWeek(date));
@@ -483,6 +483,18 @@ function DayDetailSheet({ date, state, setState, onClose }) {
     const next = { ...state };
     const t = { ...(next.trips[dateKey] || { attendance: {} }) };
     t.driverId = memberId;
+    delete t.solo;
+    t.attendance = { ...(t.attendance || {}) };
+    t.attendance[memberId] = "drove";
+    next.trips = { ...next.trips, [dateKey]: t };
+    setState(next);
+    setPendingDriver(null);
+  }
+  function setSolo(memberId) {
+    const next = { ...state };
+    const t = { ...(next.trips[dateKey] || { attendance: {} }) };
+    t.driverId = memberId;
+    t.solo = true;
     t.attendance = { ...(t.attendance || {}) };
     t.attendance[memberId] = "drove";
     next.trips = { ...next.trips, [dateKey]: t };
@@ -494,6 +506,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
     next.weeklyAssignments = { ...(next.weeklyAssignments || {}), [weekKey]: memberId };
     const t = { ...(next.trips[dateKey] || { attendance: {} }) };
     t.driverId = memberId;
+    delete t.solo;
     t.attendance = { ...(t.attendance || {}) };
     t.attendance[memberId] = "drove";
     next.trips = { ...next.trips, [dateKey]: t };
@@ -573,7 +586,9 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                 <Avatar member={driverObj} size={42} />
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, color: C.textDim }}>
-                    {dayDriver.source === "logged"
+                    {dayDriver.solo
+                      ? "Solo gefahren · nicht gewertet"
+                      : dayDriver.source === "logged"
                       ? "Hat gefahren"
                       : dayDriver.isSubstitute
                       ? "Vertretung"
@@ -632,6 +647,11 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                           borderRadius: 999, padding: "5px 10px",
                           fontSize: 11, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
                         }}>Nur dieser Tag</button>
+                        <button onClick={() => setSolo(m.id)} title="Allein gefahren – zählt nicht für die faire Aufteilung" style={{
+                          background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
+                          borderRadius: 999, padding: "5px 10px",
+                          fontSize: 11, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
+                        }}>Solo</button>
                         <button onClick={() => setPendingDriver(null)} style={{
                           background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
                           borderRadius: 999, padding: "5px 7px", cursor: "pointer",
@@ -698,6 +718,18 @@ function TodayView({ state, setState, today, onTabChange }) {
     const next = { ...state };
     const t = { ...(next.trips[todayKey] || { attendance: {} }) };
     t.driverId = memberId;
+    delete t.solo;
+    t.attendance = { ...(t.attendance || {}) };
+    t.attendance[memberId] = "drove";
+    next.trips = { ...next.trips, [todayKey]: t };
+    setState(next);
+    setPendingDriver(null);
+  }
+  function setSoloToday(memberId) {
+    const next = { ...state };
+    const t = { ...(next.trips[todayKey] || { attendance: {} }) };
+    t.driverId = memberId;
+    t.solo = true;
     t.attendance = { ...(t.attendance || {}) };
     t.attendance[memberId] = "drove";
     next.trips = { ...next.trips, [todayKey]: t };
@@ -709,6 +741,7 @@ function TodayView({ state, setState, today, onTabChange }) {
     next.weeklyAssignments = { ...(next.weeklyAssignments || {}), [currentWeekKey]: memberId };
     const t = { ...(next.trips[todayKey] || { attendance: {} }) };
     t.driverId = memberId;
+    delete t.solo;
     t.attendance = { ...(t.attendance || {}) };
     t.attendance[memberId] = "drove";
     next.trips = { ...next.trips, [todayKey]: t };
@@ -802,7 +835,9 @@ function TodayView({ state, setState, today, onTabChange }) {
               }}>
                 <Car size={14} />
                 {trip.driverId
-                  ? (state.weeklyAssignments?.[currentWeekKey] === trip.driverId
+                  ? (trip.solo
+                      ? "Solo · nicht gewertet"
+                      : state.weeklyAssignments?.[currentWeekKey] === trip.driverId
                       ? "Wochenfahrer"
                       : "Heute gefahren")
                   : dayDriver?.isSubstitute ? "Vertretung heute"
@@ -816,7 +851,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                       {driver.name}
                     </div>
                     <div style={{ fontSize: 13, color: C.textDim, marginTop: 4 }}>
-                      {trip.driverId ? "fährt heute"
+                      {trip.driverId ? (trip.solo ? "ist heute solo gefahren" : "fährt heute")
                         : dayDriver.isSubstitute ? "übernimmt für " + (state.members.find((m) => m.id === dayDriver.originalDriverId)?.name || "Wochenfahrer")
                         : "ist als Nächste·r dran"}
                     </div>
@@ -864,7 +899,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                     </div>
                     <div style={{ fontSize: 12, color: C.textDim, marginTop: 2 }}>
                       {isPending ? <span style={{ color: C.amber }}>Wann fährt {m.name}?</span>
-                        : isDriver ? "🚗 fährt"
+                        : isDriver ? (trip.solo ? "🚗 solo (nicht gewertet)" : "🚗 fährt")
                         : status === "rode" ? "🚙 mitgefahren"
                         : status === "sick" ? "🤒 krank"
                         : status === "vacation" ? "✈️ Urlaub"
@@ -884,6 +919,11 @@ function TodayView({ state, setState, today, onTabChange }) {
                         borderRadius: 999, padding: "6px 12px",
                         fontSize: 12, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
                       }}>Nur heute</button>
+                      <button onClick={() => setSoloToday(m.id)} title="Allein gefahren – zählt nicht für die faire Aufteilung" style={{
+                        background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
+                        borderRadius: 999, padding: "6px 12px",
+                        fontSize: 12, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
+                      }}>Solo</button>
                       <button onClick={() => setPendingDriver(null)} style={{
                         background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
                         borderRadius: 999, padding: "6px 8px", cursor: "pointer",
@@ -1008,8 +1048,9 @@ function WeekView({ state, setState, today }) {
                       <div style={{ color: C.text, fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {driver.name}
                       </div>
-                      <div style={{ fontSize: 11, color: dayDr.isSubstitute ? C.blue : C.textDim }}>
-                        {dayDr.source === "logged" ? "ist gefahren"
+                      <div style={{ fontSize: 11, color: dayDr.solo ? C.textFaint : dayDr.isSubstitute ? C.blue : C.textDim }}>
+                        {dayDr.solo ? "solo · nicht gewertet"
+                          : dayDr.source === "logged" ? "ist gefahren"
                           : dayDr.isSubstitute ? "Vertretung"
                           : "Vorschlag"}
                       </div>
@@ -1314,10 +1355,18 @@ function PlanningView({ state, setState, today }) {
 // ─────────────────────────────────────────────────────────────────────
 function StatsView({ state }) {
   const stats = useMemo(() => {
-    const counts = {}, rode = {}, sick = {}, vacation = {};
-    state.members.forEach((m) => { counts[m.id] = 0; rode[m.id] = 0; sick[m.id] = 0; vacation[m.id] = 0; });
+    const counts = {}, rode = {}, sick = {}, vacation = {}, solo = {};
+    state.members.forEach((m) => { counts[m.id] = 0; rode[m.id] = 0; sick[m.id] = 0; vacation[m.id] = 0; solo[m.id] = 0; });
+    let soloTrips = 0;
     Object.values(state.trips).forEach((trip) => {
-      if (trip.driverId && counts[trip.driverId] !== undefined) counts[trip.driverId] += 1;
+      if (trip.driverId !== undefined && trip.driverId !== null) {
+        if (trip.solo) {
+          if (solo[trip.driverId] !== undefined) solo[trip.driverId] += 1;
+          soloTrips += 1;
+        } else if (counts[trip.driverId] !== undefined) {
+          counts[trip.driverId] += 1;
+        }
+      }
       if (trip.attendance) {
         Object.entries(trip.attendance).forEach(([mid, status]) => {
           if (status === "rode" && rode[mid] !== undefined) rode[mid] += 1;
@@ -1326,12 +1375,16 @@ function StatsView({ state }) {
         });
       }
     });
-    return { counts, rode, sick, vacation };
+    return { counts, rode, sick, vacation, solo, soloTrips };
   }, [state]);
 
   const totalTrips = Object.values(stats.counts).reduce((a, b) => a + b, 0);
   const fairShare = state.members.length > 0 ? totalTrips / state.members.length : 0;
-  const totalKm = totalTrips * (state.kmPerTrip || 30);
+  const kmPer = state.kmPerTrip || 30;
+  const totalKm = totalTrips * kmPer;
+  const soloKm = stats.soloTrips * kmPer;
+  // CO2: nur gemeinschaftliche Fahrten sparen etwas (jede:r Mitfahrende spart eine eigene Fahrt).
+  // Solo-Fahrten transportieren niemanden zusätzlich → kein CO2-Vorteil.
   const co2Saved = totalKm * Math.max(0, state.members.length - 1) * 0.12;
   const max = Math.max(1, ...Object.values(stats.counts));
   const ranked = [...state.members].sort((a, b) => (stats.counts[a.id] || 0) - (stats.counts[b.id] || 0));
@@ -1346,6 +1399,9 @@ function StatsView({ state }) {
         <KpiCard label="Fairer Anteil" value={fairShare.toFixed(1)} suffix="je Person" accent={C.blue} />
         <KpiCard label="Gefahrene Kilometer" value={totalKm.toLocaleString("de-DE")} suffix="km" accent={C.text} />
         <KpiCard label="CO₂ eingespart" value={(co2Saved / 1000).toFixed(1)} suffix="kg" accent={C.green} />
+        {stats.soloTrips > 0 && (
+          <KpiCard label="Solo-Fahrten" value={stats.soloTrips} suffix={`Tage · ${soloKm.toLocaleString("de-DE")} km`} accent={C.textDim} />
+        )}
       </div>
 
       {state.members.length === 0 ? (
@@ -1374,7 +1430,7 @@ function StatsView({ state }) {
                       )}
                     </div>
                     <div style={{ fontSize: 11, color: C.textDim, fontFamily: FONT_MONO }}>
-                      {stats.rode[m.id] || 0} mit · {stats.sick[m.id] || 0} krank · {stats.vacation[m.id] || 0} Urlaub
+                      {stats.rode[m.id] || 0} mit · {stats.sick[m.id] || 0} krank · {stats.vacation[m.id] || 0} Urlaub{(stats.solo[m.id] || 0) > 0 ? ` · ${stats.solo[m.id]} solo` : ""}
                     </div>
                   </div>
                   <div style={{ textAlign: "right" }}>
@@ -1485,7 +1541,7 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
         const d = addDays(start, w * 7 + i);
         if (!isCommuteDay(d)) continue;
         const dr = computeDayDriver(state, d);
-        if (!dr) continue;
+        if (!dr || dr.solo) continue;
         const m = state.members.find((mm) => mm.id === dr.id);
         if (!m) continue;
         events.push({ date: d, member: m, isSubstitute: dr.isSubstitute });
