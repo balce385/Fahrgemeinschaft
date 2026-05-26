@@ -247,7 +247,7 @@ function statusOf(state, dateKey, memberId) {
 function isAvailableOn(state, date, memberId) {
   if (!isCommuteDay(date)) return false;
   const s = statusOf(state, ymd(date), memberId);
-  return s !== "sick" && s !== "vacation" && s !== "off";
+  return s !== "sick" && s !== "vacation" && s !== "off" && s !== "solo";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -493,10 +493,14 @@ function DayDetailSheet({ date, state, setState, onClose }) {
   function setSolo(memberId) {
     const next = { ...state };
     const t = { ...(next.trips[dateKey] || { attendance: {} }) };
-    t.driverId = memberId;
-    t.solo = true;
     t.attendance = { ...(t.attendance || {}) };
-    t.attendance[memberId] = "drove";
+    if (t.attendance[memberId] === "solo") {
+      delete t.attendance[memberId];
+    } else {
+      t.attendance[memberId] = "solo";
+      // Solo-Person ist nicht der Fahrgemeinschafts-Fahrer
+      if (t.driverId === memberId) { delete t.driverId; delete t.solo; }
+    }
     next.trips = { ...next.trips, [dateKey]: t };
     setState(next);
     setPendingDriver(null);
@@ -586,9 +590,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                 <Avatar member={driverObj} size={42} />
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, color: C.textDim }}>
-                    {dayDriver.solo
-                      ? "Hat gefahren · solo (nicht gewertet)"
-                      : dayDriver.source === "logged"
+                    {dayDriver.source === "logged"
                       ? "Hat gefahren"
                       : dayDriver.isSubstitute
                       ? "Vertretung"
@@ -647,11 +649,6 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                           borderRadius: 999, padding: "5px 10px",
                           fontSize: 11, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
                         }}>Nur dieser Tag</button>
-                        <button onClick={() => setSolo(m.id)} title="Allein gefahren – zählt nicht für die faire Aufteilung" style={{
-                          background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
-                          borderRadius: 999, padding: "5px 10px",
-                          fontSize: 11, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
-                        }}>Solo</button>
                         <button onClick={() => setPendingDriver(null)} style={{
                           background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
                           borderRadius: 999, padding: "5px 7px", cursor: "pointer",
@@ -662,6 +659,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
                         <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={11} />} onClick={() => handleFahrerTap(m.id)} />
                         <StatusPill active={status === "rode"} color={C.blue} label="Mit" icon={<Users size={11} />} onClick={() => setAttendance(m.id, "rode")} />
+                        <StatusPill active={status === "solo"} color={C.textDim} label="Solo" icon={<Car size={11} />} onClick={() => setSolo(m.id)} />
                         <StatusPill active={status === "sick"} color={C.red} label="Krank" icon={<Thermometer size={11} />} onClick={() => setAttendance(m.id, "sick")} />
                         <StatusPill active={status === "vacation"} color={C.green} label="Urlaub" icon={<Plane size={11} />} onClick={() => setAttendance(m.id, "vacation")} />
                       </div>
@@ -728,10 +726,13 @@ function TodayView({ state, setState, today, onTabChange }) {
   function setSoloToday(memberId) {
     const next = { ...state };
     const t = { ...(next.trips[todayKey] || { attendance: {} }) };
-    t.driverId = memberId;
-    t.solo = true;
     t.attendance = { ...(t.attendance || {}) };
-    t.attendance[memberId] = "drove";
+    if (t.attendance[memberId] === "solo") {
+      delete t.attendance[memberId];
+    } else {
+      t.attendance[memberId] = "solo";
+      if (t.driverId === memberId) { delete t.driverId; delete t.solo; }
+    }
     next.trips = { ...next.trips, [todayKey]: t };
     setState(next);
     setPendingDriver(null);
@@ -835,9 +836,7 @@ function TodayView({ state, setState, today, onTabChange }) {
               }}>
                 <Car size={14} />
                 {trip.driverId
-                  ? (trip.solo
-                      ? "Gefahren · Solo"
-                      : state.weeklyAssignments?.[currentWeekKey] === trip.driverId
+                  ? (state.weeklyAssignments?.[currentWeekKey] === trip.driverId
                       ? "Wochenfahrer"
                       : "Heute gefahren")
                   : dayDriver?.isSubstitute ? "Vertretung heute"
@@ -851,7 +850,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                       {driver.name}
                     </div>
                     <div style={{ fontSize: 13, color: C.textDim, marginTop: 4 }}>
-                      {trip.driverId ? (trip.solo ? "ist heute gefahren · solo" : "fährt heute")
+                      {trip.driverId ? "fährt heute"
                         : dayDriver.isSubstitute ? "übernimmt für " + (state.members.find((m) => m.id === dayDriver.originalDriverId)?.name || "Wochenfahrer")
                         : "ist als Nächste·r dran"}
                     </div>
@@ -899,8 +898,9 @@ function TodayView({ state, setState, today, onTabChange }) {
                     </div>
                     <div style={{ fontSize: 12, color: C.textDim, marginTop: 2 }}>
                       {isPending ? <span style={{ color: C.amber }}>Wann fährt {m.name}?</span>
-                        : isDriver ? (trip.solo ? "🚗 gefahren · solo (nicht gewertet)" : "🚗 fährt")
+                        : isDriver ? "🚗 fährt"
                         : status === "rode" ? "🚙 mitgefahren"
+                        : status === "solo" ? "🚗 solo (nicht gewertet)"
                         : status === "sick" ? "🤒 krank"
                         : status === "vacation" ? "✈️ Urlaub"
                         : status === "off" ? "— frei"
@@ -919,11 +919,6 @@ function TodayView({ state, setState, today, onTabChange }) {
                         borderRadius: 999, padding: "6px 12px",
                         fontSize: 12, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
                       }}>Nur heute</button>
-                      <button onClick={() => setSoloToday(m.id)} title="Allein gefahren – zählt nicht für die faire Aufteilung" style={{
-                        background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
-                        borderRadius: 999, padding: "6px 12px",
-                        fontSize: 12, fontFamily: FONT_BODY, fontWeight: 600, cursor: "pointer",
-                      }}>Solo</button>
                       <button onClick={() => setPendingDriver(null)} style={{
                         background: "transparent", color: C.textDim, border: `1px solid ${C.border}`,
                         borderRadius: 999, padding: "6px 8px", cursor: "pointer",
@@ -934,6 +929,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                       <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={13} />} onClick={() => handleFahrerTap(m.id)} />
                       <StatusPill active={status === "rode"} color={C.blue} label="Mit" icon={<Users size={13} />} onClick={() => setAttendance(m.id, "rode")} />
+                      <StatusPill active={status === "solo"} color={C.textDim} label="Solo" icon={<Car size={13} />} onClick={() => setSoloToday(m.id)} />
                       <StatusPill active={status === "sick"} color={C.red} label="Krank" icon={<Thermometer size={13} />} onClick={() => setAttendance(m.id, "sick")} />
                       <StatusPill active={status === "vacation"} color={C.green} label="Urlaub" icon={<Plane size={13} />} onClick={() => setAttendance(m.id, "vacation")} />
                     </div>
@@ -1008,6 +1004,7 @@ function WeekView({ state, setState, today }) {
           const sickCount = Object.values(att).filter((v) => v === "sick").length;
           const vacCount = Object.values(att).filter((v) => v === "vacation").length;
           const rodeCount = Object.values(att).filter((v) => v === "rode").length;
+          const soloCount = Object.values(att).filter((v) => v === "solo").length;
 
           return (
             <Card
@@ -1045,23 +1042,20 @@ function WeekView({ state, setState, today }) {
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <Avatar member={driver} size={28} />
                     <div style={{ minWidth: 0, flex: 1 }}>
-                      <div style={{ color: C.text, fontWeight: 600, fontSize: 14, display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{driver.name}</span>
-                        {dayDr.solo && (
-                          <span style={{
-                            fontSize: 9, fontFamily: FONT_MONO, color: C.textDim,
-                            border: `1px solid ${C.border}`, padding: "1px 5px", borderRadius: 3,
-                            letterSpacing: "0.1em", flexShrink: 0,
-                          }}>SOLO</span>
-                        )}
+                      <div style={{ color: C.text, fontWeight: 600, fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {driver.name}
                       </div>
-                      <div style={{ fontSize: 11, color: dayDr.isSubstitute && !dayDr.solo ? C.blue : C.textDim }}>
-                        {dayDr.solo ? "ist gefahren · nicht gewertet"
-                          : dayDr.source === "logged" ? "ist gefahren"
+                      <div style={{ fontSize: 11, color: dayDr.isSubstitute ? C.blue : C.textDim }}>
+                        {dayDr.source === "logged" ? "ist gefahren"
                           : dayDr.isSubstitute ? "Vertretung"
                           : "Vorschlag"}
                       </div>
                     </div>
+                  </div>
+                ) : soloCount > 0 ? (
+                  <div style={{ color: C.textDim, fontSize: 13 }}>
+                    {soloCount === 1 ? "1 Person solo" : `${soloCount} Personen solo`}
+                    <span style={{ color: C.textFaint }}> · nicht gewertet</span>
                   </div>
                 ) : (
                   <div style={{ color: C.textFaint, fontSize: 13, fontStyle: "italic" }}>
@@ -1071,6 +1065,7 @@ function WeekView({ state, setState, today }) {
               </div>
               <div style={{ display: "flex", gap: 6, fontSize: 11, color: C.textDim }}>
                 {rodeCount > 0 && <span style={{ display: "flex", alignItems: "center", gap: 3 }}><Users size={11} />{rodeCount}</span>}
+                {soloCount > 0 && driver && <span style={{ display: "flex", alignItems: "center", gap: 3 }}><Car size={11} />{soloCount}</span>}
                 {sickCount > 0 && <span style={{ color: C.red, display: "flex", alignItems: "center", gap: 3 }}><Thermometer size={11} />{sickCount}</span>}
                 {vacCount > 0 && <span style={{ color: C.green, display: "flex", alignItems: "center", gap: 3 }}><Plane size={11} />{vacCount}</span>}
               </div>
@@ -1368,6 +1363,7 @@ function StatsView({ state }) {
     Object.values(state.trips).forEach((trip) => {
       if (trip.driverId !== undefined && trip.driverId !== null) {
         if (trip.solo) {
+          // Alt-Daten: Solo war früher am Fahrer markiert
           if (solo[trip.driverId] !== undefined) solo[trip.driverId] += 1;
           soloTrips += 1;
         } else if (counts[trip.driverId] !== undefined) {
@@ -1379,6 +1375,7 @@ function StatsView({ state }) {
           if (status === "rode" && rode[mid] !== undefined) rode[mid] += 1;
           if (status === "sick" && sick[mid] !== undefined) sick[mid] += 1;
           if (status === "vacation" && vacation[mid] !== undefined) vacation[mid] += 1;
+          if (status === "solo" && solo[mid] !== undefined) { solo[mid] += 1; soloTrips += 1; }
         });
       }
     });
