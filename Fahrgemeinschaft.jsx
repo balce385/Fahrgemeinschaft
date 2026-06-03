@@ -173,6 +173,7 @@ const defaultGroup = {
   trips: {},
   weeklyAssignments: {},
   kmPerTrip: 30,
+  adminMemberId: null,
   updatedAt: 0,
   lastEditor: null,
   createdAt: new Date().toISOString(),
@@ -248,6 +249,89 @@ function isAvailableOn(state, date, memberId) {
   if (!isCommuteDay(date)) return false;
   const s = statusOf(state, ymd(date), memberId);
   return s !== "sick" && s !== "vacation" && s !== "off" && s !== "solo";
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// LOGIK: BERECHTIGUNGEN (Admin + "jede·r nur eigene Daten")
+// ─────────────────────────────────────────────────────────────────────
+// Wer ist Admin? Explizit gesetzt, sonst das erste Mitglied (damit
+// Bestands-Gruppen nicht ausgesperrt werden und die·der Ersteller·in,
+// die·der das erste Mitglied anlegt, automatisch Admin wird).
+function effectiveAdminId(group) {
+  return group?.adminMemberId || group?.members?.[0]?.id || null;
+}
+function isAdminUser(group, myMemberId) {
+  return Boolean(myMemberId) && myMemberId === effectiveAdminId(group);
+}
+
+// Felder, die nur der·die Admin ändern darf:
+//   members, weeklyAssignments, kmPerTrip, adminMemberId,
+//   sowie pro Tag: driverId / solo / fremde Anwesenheiten.
+// Ein normales Mitglied darf ausschliesslich die EIGENE Anwesenheit
+// (krank / Urlaub / mitgefahren / solo) an einem Tag setzen.
+// Diese Funktion baut aus dem alten Stand + den gewuenschten Aenderungen
+// einen "bereinigten" neuen Stand: alles, was das Mitglied nicht aendern
+// darf, wird auf den alten Stand zurueckgesetzt. So bleibt der Plan auch
+// dann geschuetzt, wenn irgendwo in der UI ein Knopf vergessen wurde.
+function enforcePermissions(prevGroup, nextGroup, myMemberId) {
+  // Admin (oder Ersteinrichtung ohne Mitglieder) darf alles.
+  if (isAdminUser(nextGroup, myMemberId) || (prevGroup.members?.length || 0) === 0) {
+    return nextGroup;
+  }
+  // Kein eigenes Mitglied gewaehlt -> gar keine geteilten Aenderungen erlaubt.
+  if (!myMemberId) {
+    return {
+      ...nextGroup,
+      members: prevGroup.members,
+      weeklyAssignments: prevGroup.weeklyAssignments,
+      kmPerTrip: prevGroup.kmPerTrip,
+      adminMemberId: prevGroup.adminMemberId,
+      trips: prevGroup.trips,
+    };
+  }
+
+  // Geschuetzte Felder unveraendert uebernehmen.
+  const result = {
+    ...nextGroup,
+    members: prevGroup.members,
+    weeklyAssignments: prevGroup.weeklyAssignments,
+    kmPerTrip: prevGroup.kmPerTrip,
+    adminMemberId: prevGroup.adminMemberId,
+  };
+
+  // Trips bereinigen: alter Stand ist die Basis, nur die EIGENE
+  // Anwesenheit des Mitglieds wird aus dem gewuenschten Stand uebernommen.
+  const prevTrips = prevGroup.trips || {};
+  const nextTrips = nextGroup.trips || {};
+  const trips = {};
+  const allDates = new Set([...Object.keys(prevTrips), ...Object.keys(nextTrips)]);
+
+  allDates.forEach((dateKey) => {
+    const prevTrip = prevTrips[dateKey];
+    const nextTrip = nextTrips[dateKey];
+    // Basis = alter Trip (driverId/solo/fremde Anwesenheit unangetastet).
+    const base = prevTrip
+      ? { ...prevTrip, attendance: { ...(prevTrip.attendance || {}) } }
+      : { attendance: {} };
+
+    // Gewuenschter eigener Status an diesem Tag.
+    const desiredOwn = nextTrip?.attendance?.[myMemberId];
+    if (desiredOwn === undefined) {
+      // "drove" duerfen Mitglieder NICHT fuer sich selbst setzen (das macht
+      // der·die Admin ueber die Fahrer-Auswahl). Eigenen Status entfernen.
+      if (base.attendance[myMemberId] && base.attendance[myMemberId] !== "drove") {
+        delete base.attendance[myMemberId];
+      }
+    } else if (desiredOwn !== "drove") {
+      base.attendance[myMemberId] = desiredOwn;
+    }
+
+    const hasContent = base.driverId || Object.keys(base.attendance).length > 0;
+    if (hasContent) trips[dateKey] = base;
+  });
+
+  result.trips = trips;
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -369,6 +453,92 @@ function computeDayDriver(state, date) {
     return state.members.indexOf(a) - state.members.indexOf(b);
   });
   return { id: sorted[0].id, source: "substitute", isSubstitute: true, originalDriverId: wk.id };
+}
+
+// Liefert die "gefahrene Wochen"-Zähler so, wie sie zum Zeitpunkt der
+// Entscheidung für diese Woche stehen (inkl. Vor-Projektion der Wochen
+// dazwischen). Identische Logik wie getWeekDriver, aber nur lesend.
+function weekDriverCounts(state, weekStart) {
+  const counts = {};
+  const driverWeeks = {};
+  state.members.forEach((m) => { counts[m.id] = 0; driverWeeks[m.id] = new Set(); });
+  Object.entries(state.trips).forEach(([date, trip]) => {
+    if (trip.driverId && !trip.solo && driverWeeks[trip.driverId]) {
+      driverWeeks[trip.driverId].add(ymd(startOfWeek(parseYmd(date))));
+    }
+  });
+  state.members.forEach((m) => { counts[m.id] = driverWeeks[m.id].size; });
+
+  const currentWeekStart = startOfWeek(new Date());
+  if (weekStart.getTime() <= currentWeekStart.getTime()) return counts;
+
+  let cursor = new Date(currentWeekStart);
+  while (cursor.getTime() < weekStart.getTime()) {
+    const cKey = ymd(cursor);
+    let projectedId = null;
+    if (state.weeklyAssignments?.[cKey]) {
+      projectedId = state.weeklyAssignments[cKey];
+    } else {
+      for (let i = 0; i < 5; i++) {
+        const d = addDays(cursor, i);
+        if (!isCommuteDay(d)) continue;
+        const trip = state.trips[ymd(d)];
+        if (trip?.driverId && !trip.solo) { projectedId = trip.driverId; break; }
+      }
+      if (!projectedId) { const w = pickWinner(state, cursor, counts); if (w) projectedId = w.id; }
+    }
+    if (projectedId && !driverWeeks[projectedId]?.has(cKey)) {
+      counts[projectedId] = (counts[projectedId] || 0) + 1;
+      driverWeeks[projectedId]?.add(cKey);
+    }
+    cursor = addDays(cursor, 7);
+  }
+  return counts;
+}
+
+// Erklärt in Worten, warum diese Person die·der Wochenfahrer·in ist –
+// mit Bezug auf die Statistik (gefahrene Wochen vs. fairer Anteil).
+function explainWeekDriver(state, weekStart, wd) {
+  if (!wd || state.members.length === 0) return null;
+  const wkKey = ymd(weekStart);
+  if (state.weeklyAssignments?.[wkKey]) {
+    return "Diese Woche wurde manuell festgelegt – überschreibt die faire Rotation.";
+  }
+  if (wd.source === "logged") {
+    return "Aus dem Verlauf übernommen – diese Woche wurde bereits gefahren.";
+  }
+
+  const counts = weekDriverCounts(state, weekStart);
+  // Verfügbare Personen für diese Woche (wie bei der Auswahl).
+  const available = state.members.filter((m) =>
+    [0, 1, 2, 3, 4].some((i) => isAvailableOn(state, addDays(weekStart, i), m.id))
+  );
+  const total = state.members.reduce((a, m) => a + (counts[m.id] || 0), 0);
+  const avg = state.members.length ? total / state.members.length : 0;
+  const myCount = counts[wd.id] || 0;
+  const dev = myCount - avg;
+
+  const availCounts = available.map((m) => counts[m.id] || 0);
+  const minAvail = availCounts.length ? Math.min(...availCounts) : 0;
+  const tiedAtMin = available.filter((m) => (counts[m.id] || 0) === minAvail);
+  const globalMin = Math.min(...state.members.map((m) => counts[m.id] || 0));
+
+  // Der·die eigentlich am wenigsten Gefahrene ist abwesend?
+  let prefix = "";
+  if (myCount > globalMin) {
+    prefix = "Übernimmt, weil wer weniger gefahren ist diese Woche abwesend ist. ";
+  }
+
+  const devTxt = dev < -0.05
+    ? `${Math.abs(dev).toFixed(1)} unter`
+    : dev > 0.05
+    ? `${dev.toFixed(1)} über`
+    : "genau auf";
+
+  if (tiedAtMin.length > 1 && myCount === minAvail) {
+    return `${prefix}Gleichstand bei ${myCount} gefahrenen Wochen – nach Mitglieder-Reihenfolge ist diese Person dran (${devTxt} dem fairen Schnitt von ${avg.toFixed(1)}).`;
+  }
+  return `${prefix}Bisher am seltensten gefahren: ${myCount} Woche${myCount === 1 ? "" : "n"} – das ist ${devTxt} dem fairen Schnitt von ${avg.toFixed(1)}. Deshalb als Nächste·r dran.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -637,7 +807,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                         <div style={{ fontSize: 11, color: C.amber, marginTop: 2 }}>Wann fährt {m.name}?</div>
                       )}
                     </div>
-                    {isPending ? (
+                    {state.isAdmin && isPending ? (
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
                         <button onClick={() => setWholeWeek(m.id)} style={{
                           background: C.amber, color: "#0b0b0d", border: "none",
@@ -655,13 +825,24 @@ function DayDetailSheet({ date, state, setState, onClose }) {
                           display: "inline-flex", alignItems: "center",
                         }}><X size={11} /></button>
                       </div>
-                    ) : (
+                    ) : (state.isAdmin || m.id === state.myMemberId) ? (
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                        <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={11} />} onClick={() => handleFahrerTap(m.id)} />
+                        {state.isAdmin && (
+                          <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={11} />} onClick={() => handleFahrerTap(m.id)} />
+                        )}
                         <StatusPill active={status === "rode"} color={C.blue} label="Mit" icon={<Users size={11} />} onClick={() => setAttendance(m.id, "rode")} />
                         <StatusPill active={status === "solo"} color={C.textDim} label="Solo" icon={<Car size={11} />} onClick={() => setSolo(m.id)} />
                         <StatusPill active={status === "sick"} color={C.red} label="Krank" icon={<Thermometer size={11} />} onClick={() => setAttendance(m.id, "sick")} />
                         <StatusPill active={status === "vacation"} color={C.green} label="Urlaub" icon={<Plane size={11} />} onClick={() => setAttendance(m.id, "vacation")} />
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 11, fontFamily: FONT_MONO, color: C.textDim }}>
+                        {isDriver ? <span style={{ color: C.amber }}>fährt</span>
+                          : status === "rode" ? "mit"
+                          : status === "solo" ? "solo"
+                          : status === "sick" ? <span style={{ color: C.red }}>krank</span>
+                          : status === "vacation" ? <span style={{ color: C.green }}>Urlaub</span>
+                          : "—"}
                       </div>
                     )}
                   </div>
@@ -669,7 +850,7 @@ function DayDetailSheet({ date, state, setState, onClose }) {
               })}
             </Card>
 
-            {(trip.driverId || Object.keys(trip.attendance || {}).length > 0) && (
+            {state.isAdmin && (trip.driverId || Object.keys(trip.attendance || {}).length > 0) && (
               <Btn variant="ghost" onClick={clearTrip} style={{ width: "100%", marginTop: 12, justifyContent: "center" }}>
                 <RotateCcw size={14} />Tag zurücksetzen
               </Btn>
@@ -907,7 +1088,7 @@ function TodayView({ state, setState, today, onTabChange }) {
                         : "noch offen"}
                     </div>
                   </div>
-                  {isPending ? (
+                  {state.isAdmin && isPending ? (
                     <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
                       <button onClick={() => setWeekDriverHere(m.id)} style={{
                         background: C.amber, color: "#0b0b0d", border: "none",
@@ -925,21 +1106,23 @@ function TodayView({ state, setState, today, onTabChange }) {
                         display: "inline-flex", alignItems: "center",
                       }}><X size={12} /></button>
                     </div>
-                  ) : (
+                  ) : (state.isAdmin || m.id === state.myMemberId) ? (
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                      <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={13} />} onClick={() => handleFahrerTap(m.id)} />
+                      {state.isAdmin && (
+                        <StatusPill active={isDriver} color={C.amber} label="Fahrer" icon={<Car size={13} />} onClick={() => handleFahrerTap(m.id)} />
+                      )}
                       <StatusPill active={status === "rode"} color={C.blue} label="Mit" icon={<Users size={13} />} onClick={() => setAttendance(m.id, "rode")} />
                       <StatusPill active={status === "solo"} color={C.textDim} label="Solo" icon={<Car size={13} />} onClick={() => setSoloToday(m.id)} />
                       <StatusPill active={status === "sick"} color={C.red} label="Krank" icon={<Thermometer size={13} />} onClick={() => setAttendance(m.id, "sick")} />
                       <StatusPill active={status === "vacation"} color={C.green} label="Urlaub" icon={<Plane size={13} />} onClick={() => setAttendance(m.id, "vacation")} />
                     </div>
-                  )}
+                  ) : null}
                 </div>
               );
             })}
           </Card>
 
-          {(trip.driverId || Object.keys(trip.attendance || {}).length > 0) && (
+          {state.isAdmin && (trip.driverId || Object.keys(trip.attendance || {}).length > 0) && (
             <Btn variant="ghost" onClick={clearTrip} style={{ width: "100%", justifyContent: "center" }}>
               <RotateCcw size={14} />Heute zurücksetzen
             </Btn>
@@ -1093,15 +1276,23 @@ function PlanningView({ state, setState, today }) {
   const [absenceType, setAbsenceType] = useState("vacation");
   const [selectedDay, setSelectedDay] = useState(null);
 
+  // Nicht-Admins dürfen nur die eigene Abwesenheit eintragen.
+  const lockToSelf = !state.isAdmin && Boolean(state.myMemberId);
+  const effMemberId = lockToSelf ? state.myMemberId : memberId;
+
   // sync member when settings change
   useEffect(() => {
+    if (lockToSelf) {
+      if (memberId !== state.myMemberId) setMemberId(state.myMemberId);
+      return;
+    }
     if (!state.members.find((m) => m.id === memberId) && state.members[0]) {
       setMemberId(state.members[0].id);
     }
-  }, [state.members]);
+  }, [state.members, lockToSelf, state.myMemberId]);
 
   function applyAbsence() {
-    if (!memberId || !fromDate || !toDate) return;
+    if (!effMemberId || !fromDate || !toDate) return;
     const next = { ...state, trips: { ...state.trips } };
     let d = parseYmd(fromDate);
     const end = parseYmd(toDate);
@@ -1109,7 +1300,7 @@ function PlanningView({ state, setState, today }) {
       const k = ymd(d);
       const t = { ...(next.trips[k] || { attendance: {} }) };
       t.attendance = { ...(t.attendance || {}) };
-      t.attendance[memberId] = absenceType;
+      t.attendance[effMemberId] = absenceType;
       next.trips[k] = t;
       d = addDays(d, 1);
     }
@@ -1188,15 +1379,21 @@ function PlanningView({ state, setState, today }) {
           <Card style={{ padding: 16, marginBottom: 24 }}>
             <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Wer?</label>
             <select
-              value={memberId} onChange={(e) => setMemberId(e.target.value)}
+              value={effMemberId} onChange={(e) => setMemberId(e.target.value)} disabled={lockToSelf}
               style={{
                 width: "100%", background: C.bg2, border: `1px solid ${C.border}`,
                 borderRadius: 8, padding: "10px 12px", color: C.text,
-                fontFamily: FONT_BODY, fontSize: 14, marginBottom: 14, outline: "none",
+                fontFamily: FONT_BODY, fontSize: 14, marginBottom: lockToSelf ? 6 : 14, outline: "none",
+                opacity: lockToSelf ? 0.7 : 1,
               }}
             >
               {state.members.map((m) => <option key={m.id} value={m.id} style={{ background: C.bg2 }}>{m.name}</option>)}
             </select>
+            {lockToSelf && (
+              <div style={{ fontSize: 11, color: C.textFaint, fontStyle: "italic", marginBottom: 14 }}>
+                Du kannst nur deine eigene Abwesenheit eintragen.
+              </div>
+            )}
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
               <div>
@@ -1254,6 +1451,7 @@ function PlanningView({ state, setState, today }) {
           {weeks.map((wkStart) => {
             const wd = getWeekDriver(state, wkStart);
             const wDriverObj = wd ? state.members.find((m) => m.id === wd.id) : null;
+            const reason = explainWeekDriver(state, wkStart, wd);
             return (
               <Card key={ymd(wkStart)} style={{ padding: 14, marginBottom: 10 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
@@ -1303,6 +1501,19 @@ function PlanningView({ state, setState, today }) {
                     );
                   })}
                 </div>
+                {wDriverObj && reason && (
+                  <div style={{
+                    marginTop: 10, padding: "9px 11px", borderRadius: 8,
+                    background: `${C.blue}0c`, border: `1px solid ${C.blue}22`,
+                    display: "flex", gap: 8, alignItems: "flex-start",
+                  }}>
+                    <BarChart3 size={13} color={C.blue} style={{ marginTop: 2, flexShrink: 0 }} />
+                    <div style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.45 }}>
+                      <span style={{ color: C.text, fontWeight: 600 }}>{wDriverObj.name.split(" ")[0]}</span>{" "}
+                      {reason}
+                    </div>
+                  </div>
+                )}
               </Card>
             );
           })}
@@ -1475,7 +1686,7 @@ function KpiCard({ label, value, suffix, accent }) {
 // ─────────────────────────────────────────────────────────────────────
 // VIEW: EINSTELLUNGEN
 // ─────────────────────────────────────────────────────────────────────
-function SettingsView({ state, setState, today, onLeaveGroup }) {
+function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, authInfo }) {
   const [newName, setNewName] = useState("");
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
@@ -1486,17 +1697,27 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
 
   function addMember() {
     if (!newName.trim()) return;
+    if (state.members.length > 0 && !state.isAdmin) return; // nur Admin darf Mitglieder anlegen
     const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const color = PALETTE[state.members.length % PALETTE.length];
-    setState({ ...state, members: [...state.members, { id, name: newName.trim(), color }] });
+    const next = { ...state, members: [...state.members, { id, name: newName.trim(), color }] };
+    // Erstes Mitglied: wird Admin und automatisch als "ich" gesetzt.
+    if (state.members.length === 0) {
+      next.adminMemberId = id;
+      next.myMemberId = id;
+    }
+    setState(next);
     setNewName("");
   }
   function removeMember(id) {
+    if (!state.isAdmin) return;
+    if (id === state.adminMemberId) return; // Admin-Mitglied nicht löschen
     const next = { ...state, members: state.members.filter((m) => m.id !== id) };
     if (state.myMemberId === id) next.myMemberId = null;
     setState(next);
   }
   function moveMember(idx, delta) {
+    if (!state.isAdmin) return;
     const next = [...state.members];
     const target = idx + delta;
     if (target < 0 || target >= next.length) return;
@@ -1504,9 +1725,30 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
     setState({ ...state, members: next });
   }
   function setMe(id) {
-    setState({ ...state, myMemberId: id === state.myMemberId ? null : id });
+    const next = id === state.myMemberId ? null : id;
+    // Tier 2: Identität serverseitig beanspruchen (verhindert Impersonation).
+    if (next && onClaimMember) {
+      onClaimMember(next).then((res) => {
+        if (res?.error) {
+          alert(
+            res.error === "member already claimed"
+              ? "Dieses Mitglied wurde bereits von einem anderen Konto übernommen."
+              : "Konnte Mitglied nicht zuordnen: " + res.error
+          );
+          return;
+        }
+        setState({ ...state, myMemberId: next });
+      });
+      return;
+    }
+    setState({ ...state, myMemberId: next });
+  }
+  function makeAdmin(id) {
+    if (!state.isAdmin) return;
+    setState({ ...state, adminMemberId: id });
   }
   function updateKm(km) {
+    if (!state.isAdmin) return;
     setState({ ...state, kmPerTrip: km });
   }
 
@@ -1619,6 +1861,7 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
   }
 
   function resetAll() {
+    if (!state.isAdmin) return;
     setState({
       ...state,
       members: [],
@@ -1640,6 +1883,52 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
     <div style={{ padding: "20px 18px 100px", maxWidth: 720, margin: "0 auto" }}>
       <SectionLabel style={{ marginBottom: 4 }}>Konfiguration</SectionLabel>
       <div style={{ fontFamily: FONT_DISPLAY, fontSize: 32, fontStyle: "italic", color: C.text, marginBottom: 24 }}>Einstellungen</div>
+
+      {/* Rolle */}
+      <Card style={{
+        padding: 14, marginBottom: 16,
+        border: `1px solid ${state.isAdmin ? C.amberDim : C.border}`,
+        background: state.isAdmin ? `${C.amber}0c` : C.surface,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{
+            width: 34, height: 34, borderRadius: 9, flexShrink: 0,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            background: state.isAdmin ? `${C.amber}22` : C.surface2,
+            border: `1px solid ${state.isAdmin ? C.amber : C.border}`,
+          }}>
+            {state.isAdmin ? <Sparkles size={16} color={C.amber} /> : <Users size={16} color={C.textDim} />}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14, color: C.text, fontWeight: 600 }}>
+              {state.isAdmin ? "Du bist Admin" : "Du bist Mitglied"}
+            </div>
+            <div style={{ fontSize: 12, color: C.textDim, lineHeight: 1.4 }}>
+              {state.isAdmin
+                ? "Du verwaltest Mitglieder, Rotation und alle Einträge."
+                : "Du kannst nur deine eigenen Einträge (Urlaub, Krankheit, mitgefahren) ändern."}
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      {/* Konto (nur Tier 2) */}
+      {authInfo && (
+        <>
+          <SectionLabel>Konto</SectionLabel>
+          <Card style={{ padding: 16, marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, color: C.textDim }}>Angemeldet als</div>
+                <div style={{ fontSize: 14, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {authInfo.email || "—"}
+                </div>
+              </div>
+              <Btn onClick={authInfo.onSignOut} style={{ flexShrink: 0 }}>Abmelden</Btn>
+            </div>
+          </Card>
+        </>
+      )}
 
       {/* Gruppe */}
       <SectionLabel>Eure Fahrgemeinschaft</SectionLabel>
@@ -1690,7 +1979,9 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
       {/* Mitglieder */}
       <SectionLabel>Mitglieder ({state.members.length}) · Reihenfolge = Rotation</SectionLabel>
       <Card style={{ padding: 4, marginBottom: 16 }}>
-        {state.members.map((m, i) => (
+        {state.members.map((m, i) => {
+          const isMemberAdmin = m.id === state.adminMemberId;
+          return (
           <div key={m.id} style={{
             padding: "10px 12px",
             borderBottom: i < state.members.length - 1 ? `1px solid ${C.borderSoft}` : "none",
@@ -1701,50 +1992,83 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
               width: 16, textAlign: "center",
             }}>{i + 1}</span>
             <Avatar member={m} size={36} />
-            <div style={{ flex: 1, color: C.text, fontSize: 15, fontWeight: 500 }}>{m.name}</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-              <button onClick={() => moveMember(i, -1)} disabled={i === 0}
-                style={{
-                  background: "transparent", border: "none",
-                  color: i === 0 ? C.textFaint : C.textDim,
-                  cursor: i === 0 ? "default" : "pointer", padding: "2px 4px",
-                  display: "flex", alignItems: "center",
-                }}><ChevronUp size={14} /></button>
-              <button onClick={() => moveMember(i, 1)} disabled={i === state.members.length - 1}
-                style={{
-                  background: "transparent", border: "none",
-                  color: i === state.members.length - 1 ? C.textFaint : C.textDim,
-                  cursor: i === state.members.length - 1 ? "default" : "pointer", padding: "2px 4px",
-                  display: "flex", alignItems: "center",
-                }}><ChevronDown size={14} /></button>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ color: C.text, fontSize: 15, fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
+                {isMemberAdmin && (
+                  <span style={{
+                    fontSize: 8, fontFamily: FONT_MONO, color: C.amber, flexShrink: 0,
+                    border: `1px solid ${C.amberDim}`, background: `${C.amber}11`,
+                    padding: "2px 5px", borderRadius: 4, letterSpacing: "0.1em",
+                  }}>ADMIN</span>
+                )}
+              </div>
             </div>
+            {state.isAdmin && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                <button onClick={() => moveMember(i, -1)} disabled={i === 0}
+                  style={{
+                    background: "transparent", border: "none",
+                    color: i === 0 ? C.textFaint : C.textDim,
+                    cursor: i === 0 ? "default" : "pointer", padding: "2px 4px",
+                    display: "flex", alignItems: "center",
+                  }}><ChevronUp size={14} /></button>
+                <button onClick={() => moveMember(i, 1)} disabled={i === state.members.length - 1}
+                  style={{
+                    background: "transparent", border: "none",
+                    color: i === state.members.length - 1 ? C.textFaint : C.textDim,
+                    cursor: i === state.members.length - 1 ? "default" : "pointer", padding: "2px 4px",
+                    display: "flex", alignItems: "center",
+                  }}><ChevronDown size={14} /></button>
+              </div>
+            )}
+            {state.isAdmin && !isMemberAdmin && (
+              <button onClick={() => makeAdmin(m.id)} title="Zum Admin machen"
+                style={{
+                  background: "transparent", border: `1px solid ${C.border}`,
+                  color: C.textDim, borderRadius: 8, padding: "4px 8px", cursor: "pointer",
+                  display: "flex", alignItems: "center",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = C.amber)}
+                onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
+              ><Sparkles size={14} /></button>
+            )}
             <button onClick={() => setMe(m.id)}
               style={{
                 background: state.myMemberId === m.id ? `${C.amber}22` : "transparent",
                 border: `1px solid ${state.myMemberId === m.id ? C.amber : C.border}`,
                 color: state.myMemberId === m.id ? C.amber : C.textDim,
                 borderRadius: 8, padding: "4px 10px", fontSize: 11, fontFamily: FONT_MONO,
-                fontWeight: 600, cursor: "pointer", letterSpacing: "0.1em",
+                fontWeight: 600, cursor: "pointer", letterSpacing: "0.1em", flexShrink: 0,
               }}
             >{state.myMemberId === m.id ? "ICH ✓" : "ICH"}</button>
-            <button onClick={() => removeMember(m.id)}
-              style={{ background: "transparent", border: "none", color: C.textDim, cursor: "pointer", padding: 6, borderRadius: 6 }}
-              onMouseEnter={(e) => (e.currentTarget.style.color = C.red)}
-              onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
-            ><Trash2 size={16} /></button>
+            {state.isAdmin && !isMemberAdmin && (
+              <button onClick={() => removeMember(m.id)}
+                style={{ background: "transparent", border: "none", color: C.textDim, cursor: "pointer", padding: 6, borderRadius: 6 }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = C.red)}
+                onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
+              ><Trash2 size={16} /></button>
+            )}
           </div>
-        ))}
-        <div style={{ padding: "10px 12px", display: "flex", gap: 8 }}>
-          <input type="text" placeholder="Name hinzufügen…" value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && addMember()}
-            style={{
-              flex: 1, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-              padding: "10px 12px", color: C.text, fontFamily: FONT_BODY, fontSize: 14, outline: "none",
-            }}
-          />
-          <Btn variant="primary" onClick={addMember} disabled={!newName.trim()}><UserPlus size={16} /></Btn>
-        </div>
+          );
+        })}
+        {(state.isAdmin || state.members.length === 0) ? (
+          <div style={{ padding: "10px 12px", display: "flex", gap: 8 }}>
+            <input type="text" placeholder="Name hinzufügen…" value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addMember()}
+              style={{
+                flex: 1, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
+                padding: "10px 12px", color: C.text, fontFamily: FONT_BODY, fontSize: 14, outline: "none",
+              }}
+            />
+            <Btn variant="primary" onClick={addMember} disabled={!newName.trim()}><UserPlus size={16} /></Btn>
+          </div>
+        ) : (
+          <div style={{ padding: "10px 12px", fontSize: 12, color: C.textFaint, fontStyle: "italic" }}>
+            Nur der·die Admin kann Mitglieder verwalten.
+          </div>
+        )}
       </Card>
 
       {/* Wegstrecke */}
@@ -1752,11 +2076,13 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
       <Card style={{ padding: 16, marginBottom: 16 }}>
         <label style={{ fontSize: 13, color: C.textDim, display: "block", marginBottom: 8 }}>Kilometer pro Fahrt (Hin & zurück)</label>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <input type="number" min={1} value={state.kmPerTrip || 30}
+          <input type="number" min={1} value={state.kmPerTrip || 30} disabled={!state.isAdmin}
             onChange={(e) => updateKm(Number(e.target.value) || 0)}
             style={{
               width: 100, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-              padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 16, outline: "none",
+              padding: "10px 12px", color: state.isAdmin ? C.text : C.textFaint,
+              fontFamily: FONT_MONO, fontSize: 16, outline: "none",
+              opacity: state.isAdmin ? 1 : 0.6,
             }}
           />
           <span style={{ fontFamily: FONT_MONO, color: C.textDim, fontSize: 13 }}>km</span>
@@ -1818,7 +2144,7 @@ function SettingsView({ state, setState, today, onLeaveGroup }) {
         <Btn onClick={exportJSON} style={{ width: "100%", marginBottom: 8, justifyContent: "center" }}>
           <Download size={14} />Daten als JSON exportieren
         </Btn>
-        {!showResetConfirm ? (
+        {!state.isAdmin ? null : !showResetConfirm ? (
           <Btn variant="danger" onClick={() => setShowResetConfirm(true)} style={{ width: "100%", justifyContent: "center" }}>
             <RotateCcw size={14} />Alle Daten zurücksetzen
           </Btn>
@@ -2049,6 +2375,76 @@ function Onboarding({ onCreate, onJoin }) {
 // ─────────────────────────────────────────────────────────────────────
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────────
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function submit() {
+    if (!email.trim() || busy) return;
+    setBusy(true); setErr(null);
+    const { error } = await window.storage.auth.signInWithEmail(email.trim());
+    setBusy(false);
+    if (error) setErr(error); else setSent(true);
+  }
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        body, html { margin: 0; padding: 0; background: ${C.bg}; }
+        input:focus { border-color: ${C.amber} !important; }
+      `}</style>
+      <div style={{
+        minHeight: "100vh", background: C.bg, color: C.text,
+        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+        padding: 24, fontFamily: FONT_BODY,
+      }}>
+        <div style={{ width: "100%", maxWidth: 380 }}>
+          <div style={{ fontSize: 40, marginBottom: 6 }}>🚗</div>
+          <div style={{ fontFamily: FONT_DISPLAY, fontSize: 40, fontStyle: "italic", lineHeight: 1.05, marginBottom: 8 }}>
+            Fahrgemeinschaft
+          </div>
+          <div style={{ fontSize: 14, color: C.textDim, marginBottom: 28, lineHeight: 1.5 }}>
+            Melde dich mit deiner E-Mail an. Du bekommst einen Anmelde-Link zugeschickt – kein Passwort nötig.
+          </div>
+
+          {sent ? (
+            <Card style={{ padding: 18 }}>
+              <div style={{ fontSize: 15, color: C.text, marginBottom: 6, fontWeight: 600 }}>Link verschickt ✓</div>
+              <div style={{ fontSize: 13, color: C.textDim, lineHeight: 1.5 }}>
+                Öffne die E-Mail an <b style={{ color: C.text }}>{email}</b> und tippe auf den Link.
+                Danach landest du automatisch hier.
+              </div>
+            </Card>
+          ) : (
+            <>
+              <input
+                type="email" inputMode="email" autoComplete="email"
+                placeholder="dein@email.de" value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submit()}
+                style={{
+                  width: "100%", background: C.bg2, border: `1px solid ${C.border}`,
+                  borderRadius: 10, padding: "13px 14px", color: C.text,
+                  fontFamily: FONT_BODY, fontSize: 15, outline: "none", marginBottom: 10,
+                }}
+              />
+              {err && <div style={{ fontSize: 12, color: C.red, marginBottom: 10 }}>{err}</div>}
+              <Btn variant="primary" onClick={submit} disabled={!email.trim() || busy}
+                style={{ width: "100%", justifyContent: "center", padding: "13px" }}>
+                {busy ? "senden…" : "Anmelde-Link senden"}
+              </Btn>
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
 export default function App() {
   const [localState, _setLocalState] = useState(defaultLocal);
   const [groupState, _setGroupState] = useState(defaultGroup);
@@ -2056,15 +2452,40 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle");
   const [lastSync, setLastSync] = useState(null);
+  // TIER-2-Auth-Status. requireLogin=false → Tier 1, alles wie bisher.
+  const requireLogin = Boolean(window.storage?.auth?.requireLogin);
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(!requireLogin);
   const today = new Date();
 
   // Merged state — was die Views erwarten
+  const [serverIsAdmin, setServerIsAdmin] = useState(false);
   const state = useMemo(() => ({
     ...groupState,
     myMemberId: localState.myMemberId,
     notificationsEnabled: localState.notificationsEnabled,
     groupCode: localState.groupCode,
-  }), [localState, groupState]);
+    adminMemberId: effectiveAdminId(groupState),
+    // Tier 1: lokale Heuristik (erstes Mitglied / adminMemberId).
+    // Tier 2: der Server entscheidet (Eigentümer der Gruppe).
+    isAdmin: requireLogin
+      ? serverIsAdmin
+      : isAdminUser(groupState, localState.myMemberId),
+  }), [localState, groupState, requireLogin, serverIsAdmin]);
+
+  // Tier 2: Admin-Status beim Server bestätigen lassen.
+  useEffect(() => {
+    if (!requireLogin || !window.storage?.auth || !localState.groupCode || !session) {
+      if (!requireLogin) return;
+      setServerIsAdmin(false);
+      return;
+    }
+    let cancelled = false;
+    window.storage.auth.isGroupAdmin(localState.groupCode).then((v) => {
+      if (!cancelled) setServerIsAdmin(!!v);
+    });
+    return () => { cancelled = true; };
+  }, [requireLogin, localState.groupCode, session, groupState.updatedAt]);
 
   // Erst-Laden + Migration
   useEffect(() => {
@@ -2116,6 +2537,19 @@ export default function App() {
     })();
   }, []);
 
+  // TIER-2: Auth-Session beobachten
+  useEffect(() => {
+    if (!requireLogin || !window.storage?.auth) return;
+    let unsub = () => {};
+    (async () => {
+      const s = await window.storage.auth.getSession();
+      setSession(s);
+      setAuthReady(true);
+      unsub = window.storage.auth.onChange((sess) => setSession(sess));
+    })();
+    return () => unsub();
+  }, [requireLogin]);
+
   // Polling für Synchronisation (alle 6s)
   useEffect(() => {
     if (!loaded || !localState.groupCode) return;
@@ -2147,12 +2581,12 @@ export default function App() {
   // setState — routet Änderungen an local oder shared
   const setState = useCallback((next) => {
     const localKeys = ["myMemberId", "notificationsEnabled", "groupCode"];
-    const groupKeys = ["members", "trips", "weeklyAssignments", "kmPerTrip"];
+    const groupKeys = ["members", "trips", "weeklyAssignments", "kmPerTrip", "adminMemberId"];
 
     let localChanged = false;
     let groupChanged = false;
     const newLocal = { ...localState };
-    const newGroup = { ...groupState };
+    let newGroup = { ...groupState };
 
     localKeys.forEach((k) => {
       if (next[k] !== localState[k]) {
@@ -2166,6 +2600,16 @@ export default function App() {
         groupChanged = true;
       }
     });
+
+    // Berechtigungen erzwingen: wer nicht Admin ist, darf nur die eigenen
+    // Daten ändern. Alles andere wird auf den vorherigen Stand zurückgesetzt.
+    if (groupChanged) {
+      newGroup = enforcePermissions(groupState, newGroup, newLocal.myMemberId);
+      // Falls die Bereinigung alles zurückgedreht hat: kein echter Change.
+      groupChanged = groupKeys.some(
+        (k) => JSON.stringify(newGroup[k]) !== JSON.stringify(groupState[k])
+      );
+    }
 
     if (localChanged) {
       _setLocalState(newLocal);
@@ -2188,13 +2632,18 @@ export default function App() {
   const createNewGroup = useCallback(async () => {
     const code = generateGroupCode();
     const grp = { ...defaultGroup, updatedAt: Date.now(), createdAt: new Date().toISOString() };
-    await saveGroup(code, grp);
+    if (requireLogin && window.storage?.auth) {
+      // Tier 2: Gruppe per RPC anlegen (Ersteller wird Eigentümer/Admin).
+      await window.storage.auth.createGroup(code, grp);
+    } else {
+      await saveGroup(code, grp);
+    }
     const newLocal = { ...localState, groupCode: code };
     _setGroupState(grp);
     _setLocalState(newLocal);
     await saveLocal(newLocal);
     return code;
-  }, [localState]);
+  }, [localState, requireLogin]);
 
   const joinGroup = useCallback(async (rawCode) => {
     const code = normalizeCode(rawCode);
@@ -2225,6 +2674,20 @@ export default function App() {
     { id: "stats", label: "Statistik", icon: BarChart3 },
     { id: "settings", label: "Mehr", icon: SettingsIcon },
   ];
+
+  // TIER-2: Login-Gate. Ohne gültige Session geht es nicht weiter.
+  if (requireLogin) {
+    if (!authReady) {
+      return (
+        <div style={{
+          minHeight: "100vh", background: C.bg, color: C.textDim,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontFamily: FONT_MONO, fontSize: 12, letterSpacing: "0.2em", textTransform: "uppercase",
+        }}>laden…</div>
+      );
+    }
+    if (!session) return <LoginScreen />;
+  }
 
   // Loading
   if (!loaded) {
@@ -2311,7 +2774,12 @@ export default function App() {
         ) : tab === "stats" ? (
           <StatsView state={state} />
         ) : (
-          <SettingsView state={state} setState={setState} today={today} onLeaveGroup={leaveGroup} />
+          <SettingsView state={state} setState={setState} today={today} onLeaveGroup={leaveGroup}
+            onClaimMember={requireLogin && window.storage?.auth
+              ? (mid) => window.storage.auth.claimMember(localState.groupCode, mid)
+              : null}
+            authInfo={requireLogin ? { email: session?.user?.email, onSignOut: () => window.storage.auth.signOut() } : null}
+          />
         )}
       </main>
 
