@@ -172,6 +172,7 @@ const defaultGroup = {
   members: [],
   trips: {},
   weeklyAssignments: {},
+  swapRequests: [],
   kmPerTrip: 30,
   adminMemberId: null,
   updatedAt: 0,
@@ -264,6 +265,93 @@ function isAdminUser(group, myMemberId) {
   return Boolean(myMemberId) && myMemberId === effectiveAdminId(group);
 }
 
+// Tausch-Anfragen (mitglieder-getrieben) sicher abgleichen.
+// Erlaubte Aktionen eines Mitglieds (me) in EINEM Schreibvorgang:
+//   • Anfrage anlegen: fromMemberId === me, status "pending" (keine Wochen-Änderung).
+//   • eigene offene Anfrage zurückziehen: pending → "cancelled".
+//   • an mich gerichtete Anfrage (toMemberId === me): pending → "declined" ODER
+//     pending → "accepted"; nur beim ANNEHMEN werden GENAU die beiden in der Anfrage
+//     benannten Wochen in weeklyAssignments getauscht.
+//   • eigene erledigte Anfragen (cancelled/declined/accepted) entfernen (aufräumen).
+// Eine Woche kann nur getauscht werden, wenn sie der jeweiligen Person aktuell
+// auch wirklich gehört (getWeekDriver). Alles andere wird auf den alten Stand
+// zurückgesetzt → kein unbefugtes Umbuchen fremder Wochen.
+function reconcileSwaps(prevGroup, nextGroup, me) {
+  const prevReqs = Array.isArray(prevGroup.swapRequests) ? prevGroup.swapRequests : [];
+  const nextReqs = Array.isArray(nextGroup.swapRequests) ? nextGroup.swapRequests : [];
+  const memberIds = new Set((prevGroup.members || []).map((m) => m.id));
+  const isWeekKey = (k) => typeof k === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k);
+  const ownsWeek = (mid, weekKey) => {
+    if (!isWeekKey(weekKey)) return false;
+    const wd = getWeekDriver(prevGroup, parseYmd(weekKey));
+    return Boolean(wd) && wd.id === mid;
+  };
+
+  const prevById = new Map(prevReqs.map((r) => [r.id, r]));
+  const nextById = new Map(nextReqs.map((r) => [r.id, r]));
+
+  const out = prevReqs.map((r) => ({ ...r })); // Basis = alter Stand
+  const outById = new Map(out.map((r) => [r.id, r]));
+  const weeklyAssignments = { ...(prevGroup.weeklyAssignments || {}) };
+
+  // 1) Neue Anfragen (in next, nicht in prev)
+  nextReqs.forEach((r) => {
+    if (!r || prevById.has(r.id)) return;
+    const valid =
+      r.status === "pending" &&
+      r.fromMemberId === me &&
+      memberIds.has(r.toMemberId) && r.toMemberId !== me &&
+      ownsWeek(me, r.fromWeekKey) &&
+      (r.toWeekKey == null || (isWeekKey(r.toWeekKey) && ownsWeek(r.toMemberId, r.toWeekKey)));
+    if (valid) {
+      out.push({
+        id: String(r.id),
+        fromMemberId: me,
+        fromWeekKey: r.fromWeekKey,
+        toMemberId: r.toMemberId,
+        toWeekKey: r.toWeekKey == null ? null : r.toWeekKey,
+        status: "pending",
+        createdAt: r.createdAt || Date.now(),
+      });
+    }
+  });
+
+  // 2) Entfernte Anfragen: nur erledigte, an denen me beteiligt ist (aufräumen)
+  prevReqs.forEach((p) => {
+    if (nextById.has(p.id)) return;
+    const involved = p.fromMemberId === me || p.toMemberId === me;
+    if (involved && p.status !== "pending") {
+      const idx = out.findIndex((r) => r.id === p.id);
+      if (idx >= 0) out.splice(idx, 1);
+    }
+  });
+
+  // 3) Status-Übergänge (id in prev und next)
+  prevReqs.forEach((p) => {
+    const n = nextById.get(p.id);
+    if (!n || n.status === p.status) return;
+    if (p.status !== "pending") return; // aus erledigt heraus: nichts erlaubt
+    const target = outById.get(p.id);
+    if (!target) return;
+    if (n.status === "cancelled" && p.fromMemberId === me) {
+      target.status = "cancelled";
+    } else if (n.status === "declined" && p.toMemberId === me) {
+      target.status = "declined";
+    } else if (n.status === "accepted" && p.toMemberId === me) {
+      if (
+        ownsWeek(p.fromMemberId, p.fromWeekKey) &&
+        (p.toWeekKey == null || ownsWeek(p.toMemberId, p.toWeekKey))
+      ) {
+        target.status = "accepted";
+        weeklyAssignments[p.fromWeekKey] = p.toMemberId;
+        if (p.toWeekKey != null) weeklyAssignments[p.toWeekKey] = p.fromMemberId;
+      }
+    }
+  });
+
+  return { swapRequests: out, weeklyAssignments };
+}
+
 // Felder, die nur der·die Admin ändern darf:
 //   members, weeklyAssignments, kmPerTrip, adminMemberId,
 //   sowie pro Tag: driverId / solo / fremde Anwesenheiten.
@@ -284,17 +372,22 @@ function enforcePermissions(prevGroup, nextGroup, myMemberId) {
       ...nextGroup,
       members: prevGroup.members,
       weeklyAssignments: prevGroup.weeklyAssignments,
+      swapRequests: prevGroup.swapRequests || [],
       kmPerTrip: prevGroup.kmPerTrip,
       adminMemberId: prevGroup.adminMemberId,
       trips: prevGroup.trips,
     };
   }
 
-  // Geschuetzte Felder unveraendert uebernehmen.
+  // Tausch-Anfragen + die daraus erlaubten Wochen-Zuweisungen sicher abgleichen.
+  const swap = reconcileSwaps(prevGroup, nextGroup, myMemberId);
+
+  // Geschuetzte Felder unveraendert uebernehmen (weeklyAssignments nur via Tausch).
   const result = {
     ...nextGroup,
     members: prevGroup.members,
-    weeklyAssignments: prevGroup.weeklyAssignments,
+    weeklyAssignments: swap.weeklyAssignments,
+    swapRequests: swap.swapRequests,
     kmPerTrip: prevGroup.kmPerTrip,
     adminMemberId: prevGroup.adminMemberId,
   };
@@ -1045,6 +1138,8 @@ function TodayView({ state, setState, today, onTabChange }) {
             </div>
           </Card>
 
+          <WhyPanel state={state} weekStart={startOfWeek(today)} />
+
           <SectionLabel style={{ marginTop: 24 }}>Status erfassen</SectionLabel>
           <Card style={{ padding: 4, marginBottom: 16 }}>
             {state.members.map((m, i) => {
@@ -1134,6 +1229,287 @@ function TodayView({ state, setState, today, onTabChange }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// GESAMTBILD: Warum diese·r Fahrer·in?  (Fairness-Ledger + Verfügbarkeit + Ausblick)
+// ─────────────────────────────────────────────────────────────────────
+function memberWeekStatus(state, weekStart, memberId) {
+  const commute = [0, 1, 2, 3, 4].map((i) => addDays(weekStart, i)).filter(isCommuteDay);
+  if (commute.length === 0) return { available: false, label: "Feiertage", color: C.amber };
+  if (commute.some((d) => isAvailableOn(state, d, memberId))) return { available: true, label: "verfügbar", color: C.green };
+  const statuses = commute.map((d) => statusOf(state, ymd(d), memberId));
+  if (statuses.includes("vacation")) return { available: false, label: "Urlaub", color: C.green };
+  if (statuses.includes("sick")) return { available: false, label: "krank", color: C.red };
+  if (statuses.includes("off")) return { available: false, label: "frei", color: C.textDim };
+  return { available: false, label: "abwesend", color: C.textDim };
+}
+
+function WhyPanel({ state, weekStart }) {
+  const [open, setOpen] = useState(false);
+  if (state.members.length === 0) return null;
+
+  const wd = getWeekDriver(state, weekStart);
+  const proposed = wd ? state.members.find((m) => m.id === wd.id) : null;
+  const counts = weekDriverCounts(state, weekStart);
+  const total = state.members.reduce((a, m) => a + (counts[m.id] || 0), 0);
+  const fair = state.members.length ? total / state.members.length : 0;
+  const maxCount = Math.max(1, ...state.members.map((m) => counts[m.id] || 0));
+  const ranked = [...state.members].sort((a, b) => {
+    const d = (counts[a.id] || 0) - (counts[b.id] || 0);
+    return d !== 0 ? d : state.members.indexOf(a) - state.members.indexOf(b);
+  });
+  const reason = explainWeekDriver(state, weekStart, wd);
+  const outlook = [1, 2, 3].map((k) => {
+    const ws = addDays(weekStart, 7 * k);
+    const d = getWeekDriver(state, ws);
+    return { ws, member: d ? state.members.find((m) => m.id === d.id) : null };
+  });
+
+  return (
+    <Card style={{ padding: 0, marginTop: 12, overflow: "hidden", borderColor: open ? `${C.blue}44` : C.border }}>
+      <button onClick={() => setOpen(!open)} style={{
+        width: "100%", background: "transparent", border: "none", cursor: "pointer",
+        padding: "12px 14px", display: "flex", alignItems: "center", gap: 10, color: C.text, fontFamily: FONT_BODY,
+      }}>
+        <BarChart3 size={15} color={C.blue} />
+        <div style={{ flex: 1, textAlign: "left", fontSize: 13, fontWeight: 600 }}>
+          Warum {proposed ? proposed.name.split(" ")[0] : "niemand"}? · Gesamtbild
+        </div>
+        {open ? <ChevronUp size={16} color={C.textDim} /> : <ChevronDown size={16} color={C.textDim} />}
+      </button>
+
+      {open && (
+        <div style={{ padding: "0 14px 14px" }}>
+          {reason && (
+            <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.5, marginBottom: 14 }}>{reason}</div>
+          )}
+
+          <SectionLabel style={{ marginBottom: 8 }}>Gefahrene Wochen · fairer Schnitt {fair.toFixed(1)}</SectionLabel>
+          {ranked.map((m) => {
+            const c = counts[m.id] || 0;
+            const dev = c - fair;
+            const av = memberWeekStatus(state, weekStart, m.id);
+            const isProposed = proposed && m.id === proposed.id;
+            return (
+              <div key={m.id} style={{
+                display: "flex", alignItems: "center", gap: 10, padding: "7px 8px",
+                borderRadius: 8, marginBottom: 4,
+                background: isProposed ? `${C.amber}10` : "transparent",
+                border: `1px solid ${isProposed ? C.amberDim : "transparent"}`,
+              }}>
+                <Avatar member={m} size={26} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 13, color: C.text, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name.split(" ")[0]}</span>
+                    {isProposed && (
+                      <span style={{ fontSize: 8, fontFamily: FONT_MONO, color: C.amber, border: `1px solid ${C.amberDim}`, padding: "1px 4px", borderRadius: 3, letterSpacing: "0.08em" }}>DRAN</span>
+                    )}
+                  </div>
+                  <div style={{ height: 4, background: C.bg2, borderRadius: 99, overflow: "hidden", marginTop: 4 }}>
+                    <div style={{ width: `${(c / maxCount) * 100}%`, height: "100%", background: m.color, borderRadius: 99, opacity: av.available ? 1 : 0.4 }} />
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", minWidth: 60 }}>
+                  <div style={{ fontFamily: FONT_MONO, fontSize: 14, color: C.text, lineHeight: 1 }}>{c}<span style={{ fontSize: 9, color: C.textFaint }}> Wo</span></div>
+                  <div style={{ fontSize: 9.5, fontFamily: FONT_MONO, color: av.available ? C.textFaint : av.color }}>
+                    {av.available ? `${dev > 0 ? "+" : ""}${dev.toFixed(1)}` : av.label}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          <SectionLabel style={{ marginTop: 14, marginBottom: 8 }}>Ausblick</SectionLabel>
+          <div style={{ display: "flex", gap: 6 }}>
+            {outlook.map(({ ws, member }, i) => (
+              <div key={i} style={{ flex: 1, background: C.bg2, borderRadius: 8, padding: "8px 6px", textAlign: "center" }}>
+                <div style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.textFaint, marginBottom: 5 }}>KW {isoWeek(ws)}</div>
+                {member ? (
+                  <>
+                    <div style={{ display: "flex", justifyContent: "center" }}><Avatar member={member} size={22} /></div>
+                    <div style={{ fontSize: 10, color: C.textDim, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.name.split(" ")[0]}</div>
+                  </>
+                ) : <div style={{ fontSize: 10, color: C.textFaint, padding: "6px 0" }}>—</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// WOCHEN TAUSCHEN (Anfrage → Bestätigung)
+// ─────────────────────────────────────────────────────────────────────
+function weekLabel(weekKey) {
+  const ws = parseYmd(weekKey);
+  return `KW ${isoWeek(ws)} (${ws.getDate()}.–${addDays(ws, 4).getDate()}. ${MONTHS_DE[addDays(ws, 4).getMonth()].slice(0, 3)}.)`;
+}
+function createSwapRequest(state, setState, { fromMemberId, fromWeekKey, toMemberId, toWeekKey }) {
+  const req = {
+    id: `${fromWeekKey}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    fromMemberId, fromWeekKey, toMemberId, toWeekKey: toWeekKey || null,
+    status: "pending", createdAt: Date.now(),
+  };
+  setState({ ...state, swapRequests: [...(state.swapRequests || []), req] });
+}
+function acceptSwap(state, setState, req) {
+  const swapRequests = (state.swapRequests || []).map((r) => (r.id === req.id ? { ...r, status: "accepted" } : r));
+  const weeklyAssignments = { ...(state.weeklyAssignments || {}) };
+  weeklyAssignments[req.fromWeekKey] = req.toMemberId;
+  if (req.toWeekKey) weeklyAssignments[req.toWeekKey] = req.fromMemberId;
+  setState({ ...state, swapRequests, weeklyAssignments });
+}
+function setSwapStatus(state, setState, reqId, status) {
+  setState({ ...state, swapRequests: (state.swapRequests || []).map((r) => (r.id === reqId ? { ...r, status } : r)) });
+}
+function removeSwap(state, setState, reqId) {
+  setState({ ...state, swapRequests: (state.swapRequests || []).filter((r) => r.id !== reqId) });
+}
+
+// Sheet zum Anlegen einer Tausch-Anfrage für eine konkrete (eigene) Woche.
+function SwapSheet({ state, setState, fromWeekKey, fromMemberId, today, onClose }) {
+  const others = state.members.filter((m) => m.id !== fromMemberId);
+  const [toMemberId, setToMemberId] = useState(others[0]?.id || "");
+  const [toWeekKey, setToWeekKey] = useState(null); // null = "nur abgeben"
+
+  // Wochen, in denen die Zielperson (ab dieser Woche) fährt – als Tauschoptionen.
+  const targetWeeks = useMemo(() => {
+    if (!toMemberId) return [];
+    const start = startOfWeek(today);
+    const out = [];
+    for (let i = 0; i < 8; i++) {
+      const ws = addDays(start, i * 7);
+      const key = ymd(ws);
+      if (key === fromWeekKey) continue;
+      const wd = getWeekDriver(state, ws);
+      if (wd && wd.id === toMemberId) out.push(key);
+    }
+    return out;
+  }, [state, toMemberId, today, fromWeekKey]);
+
+  useEffect(() => { setToWeekKey(null); }, [toMemberId]);
+
+  function submit() {
+    if (!toMemberId) return;
+    createSwapRequest(state, setState, { fromMemberId, fromWeekKey, toMemberId, toWeekKey });
+    onClose();
+  }
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "#000a", zIndex: 120,
+      display: "flex", alignItems: "flex-end", justifyContent: "center",
+      backdropFilter: "blur(4px)", animation: "fadein 200ms ease",
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: C.bg2, borderTop: `1px solid ${C.border}`, borderRadius: "20px 20px 0 0",
+        width: "100%", maxWidth: 720, maxHeight: "86vh", overflow: "auto",
+        padding: "20px 18px 30px", animation: "slideup 280ms cubic-bezier(.2,.9,.3,1)",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+          <div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 11, letterSpacing: "0.18em", color: C.textFaint, marginBottom: 4 }}>DEINE WOCHE</div>
+            <div style={{ fontFamily: FONT_DISPLAY, fontSize: 24, fontStyle: "italic", color: C.text }}>{weekLabel(fromWeekKey)}</div>
+          </div>
+          <button onClick={onClose} style={{ background: C.surface2, border: `1px solid ${C.border}`, color: C.textDim, borderRadius: 8, padding: 6, cursor: "pointer" }}><X size={18} /></button>
+        </div>
+
+        <SectionLabel>Mit wem tauschen?</SectionLabel>
+        <select value={toMemberId} onChange={(e) => setToMemberId(e.target.value)} style={{
+          width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
+          padding: "10px 12px", color: C.text, fontFamily: FONT_BODY, fontSize: 14, marginBottom: 16, outline: "none",
+        }}>
+          {others.map((m) => <option key={m.id} value={m.id} style={{ background: C.bg2 }}>{m.name}</option>)}
+        </select>
+
+        <SectionLabel>Wie?</SectionLabel>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+          <button onClick={() => setToWeekKey(null)} style={{
+            textAlign: "left", padding: "12px 14px", borderRadius: 10, cursor: "pointer",
+            background: toWeekKey === null ? `${C.amber}16` : C.surface,
+            border: `1px solid ${toWeekKey === null ? C.amber : C.border}`, color: C.text,
+            fontFamily: FONT_BODY, fontSize: 14,
+          }}>
+            <div style={{ fontWeight: 600 }}>Woche abgeben</div>
+            <div style={{ fontSize: 12, color: C.textDim, marginTop: 2 }}>Die andere Person übernimmt deine Woche – du bekommst keine zurück.</div>
+          </button>
+          {targetWeeks.map((key) => (
+            <button key={key} onClick={() => setToWeekKey(key)} style={{
+              textAlign: "left", padding: "12px 14px", borderRadius: 10, cursor: "pointer",
+              background: toWeekKey === key ? `${C.amber}16` : C.surface,
+              border: `1px solid ${toWeekKey === key ? C.amber : C.border}`, color: C.text,
+              fontFamily: FONT_BODY, fontSize: 14,
+            }}>
+              <div style={{ fontWeight: 600 }}>Tauschen ↔ {weekLabel(key)}</div>
+              <div style={{ fontSize: 12, color: C.textDim, marginTop: 2 }}>Ihr tauscht beide Wochen – du fährst dafür diese.</div>
+            </button>
+          ))}
+        </div>
+
+        <Btn variant="primary" onClick={submit} disabled={!toMemberId} style={{ width: "100%", justifyContent: "center" }}>
+          <ArrowRight size={16} />Tausch anfragen
+        </Btn>
+        <div style={{ fontSize: 11, color: C.textFaint, textAlign: "center", marginTop: 10 }}>
+          Wird erst wirksam, wenn die andere Person zustimmt.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Liste der Tausch-Anfragen, die mich betreffen (eingehend + ausgehend).
+function SwapRequestsList({ state, setState }) {
+  const me = state.myMemberId;
+  if (!me) return null;
+  const reqs = state.swapRequests || [];
+  const nameOf = (id) => state.members.find((m) => m.id === id)?.name.split(" ")[0] || "?";
+  const incoming = reqs.filter((r) => r.toMemberId === me && r.status === "pending");
+  const outgoing = reqs.filter((r) => r.fromMemberId === me && r.status === "pending");
+  const resolved = reqs.filter((r) => (r.fromMemberId === me || r.toMemberId === me) && r.status !== "pending");
+  if (incoming.length === 0 && outgoing.length === 0 && resolved.length === 0) return null;
+
+  const swapText = (r) => r.toWeekKey
+    ? `${weekLabel(r.fromWeekKey)} ↔ ${weekLabel(r.toWeekKey)}`
+    : `übernimmt ${weekLabel(r.fromWeekKey)}`;
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <SectionLabel>Tausch-Anfragen</SectionLabel>
+      <Card style={{ padding: 4 }}>
+        {incoming.map((r) => (
+          <div key={r.id} style={{ padding: "12px", borderBottom: `1px solid ${C.borderSoft}` }}>
+            <div style={{ fontSize: 13, color: C.text, marginBottom: 8 }}>
+              <b>{nameOf(r.fromMemberId)}</b> möchte tauschen: <span style={{ color: C.textDim }}>{swapText(r)}</span>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn variant="primary" onClick={() => acceptSwap(state, setState, r)} style={{ flex: 1, justifyContent: "center", padding: "8px" }}>Annehmen</Btn>
+              <Btn onClick={() => setSwapStatus(state, setState, r.id, "declined")} style={{ flex: 1, justifyContent: "center", padding: "8px" }}>Ablehnen</Btn>
+            </div>
+          </div>
+        ))}
+        {outgoing.map((r) => (
+          <div key={r.id} style={{ padding: "12px", borderBottom: `1px solid ${C.borderSoft}`, display: "flex", alignItems: "center", gap: 10 }}>
+            <Clock size={15} color={C.textDim} />
+            <div style={{ flex: 1, fontSize: 12.5, color: C.textDim }}>
+              An <b style={{ color: C.text }}>{nameOf(r.toMemberId)}</b>: {swapText(r)} · <span style={{ color: C.amber }}>wartet</span>
+            </div>
+            <button onClick={() => setSwapStatus(state, setState, r.id, "cancelled")} style={{ background: "transparent", border: "none", color: C.textDim, cursor: "pointer", padding: 4 }}><X size={15} /></button>
+          </div>
+        ))}
+        {resolved.slice(-3).map((r, i, arr) => (
+          <div key={r.id} style={{ padding: "10px 12px", borderBottom: i < arr.length - 1 ? `1px solid ${C.borderSoft}` : "none", display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ flex: 1, fontSize: 12, color: C.textFaint }}>
+              {swapText(r)} · {r.status === "accepted" ? <span style={{ color: C.green }}>getauscht</span> : r.status === "declined" ? "abgelehnt" : "zurückgezogen"}
+            </div>
+            <button onClick={() => removeSwap(state, setState, r.id)} style={{ background: "transparent", border: "none", color: C.textFaint, cursor: "pointer", padding: 4 }}><X size={14} /></button>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // VIEW: WOCHE
 // ─────────────────────────────────────────────────────────────────────
 function WeekView({ state, setState, today }) {
@@ -1143,9 +1519,14 @@ function WeekView({ state, setState, today }) {
   const days = [0, 1, 2, 3, 4].map((i) => addDays(weekStart, i));
   const wk = getWeekDriver(state, weekStart);
   const weekDriverObj = wk ? state.members.find((m) => m.id === wk.id) : null;
+  const [swapOpen, setSwapOpen] = useState(false);
+  const currentWeekStart = startOfWeek(today);
+  const iDriveThisWeek = Boolean(state.myMemberId) && wk && wk.id === state.myMemberId;
+  const canSwap = iDriveThisWeek && weekStart.getTime() >= currentWeekStart.getTime();
 
   return (
     <div style={{ padding: "20px 18px 100px", maxWidth: 720, margin: "0 auto" }}>
+      <SwapRequestsList state={state} setState={setState} />
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
         <div>
           <SectionLabel style={{ marginBottom: 4 }}>Kalenderwoche {isoWeek(weekStart)}</SectionLabel>
@@ -1161,16 +1542,24 @@ function WeekView({ state, setState, today }) {
       </div>
 
       {weekDriverObj && (
-        <Card style={{ padding: 16, marginBottom: 16, display: "flex", alignItems: "center", gap: 14 }}>
-          <Avatar member={weekDriverObj} size={44} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, color: C.textDim, marginBottom: 2 }}>
-              Wochenfahrer · {wk.source === "manual" ? "manuell" : wk.source === "logged" ? "schon gefahren" : "Vorschlag"}
+        <>
+          <Card style={{ padding: 16, display: "flex", alignItems: "center", gap: 14 }}>
+            <Avatar member={weekDriverObj} size={44} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: C.textDim, marginBottom: 2 }}>
+                Wochenfahrer · {wk.source === "manual" ? "manuell" : wk.source === "logged" ? "schon gefahren" : "Vorschlag"}
+              </div>
+              <div style={{ fontFamily: FONT_DISPLAY, fontSize: 22, fontStyle: "italic", color: C.text }}>{weekDriverObj.name}</div>
             </div>
-            <div style={{ fontFamily: FONT_DISPLAY, fontSize: 22, fontStyle: "italic", color: C.text }}>{weekDriverObj.name}</div>
-          </div>
-          <Car size={20} color={C.amber} />
-        </Card>
+            {canSwap ? (
+              <Btn onClick={() => setSwapOpen(true)} style={{ padding: "8px 12px", flexShrink: 0 }}><ArrowRight size={14} />Tauschen</Btn>
+            ) : (
+              <Car size={20} color={C.amber} />
+            )}
+          </Card>
+          <WhyPanel state={state} weekStart={weekStart} />
+          <div style={{ height: 16 }} />
+        </>
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1262,6 +1651,11 @@ function WeekView({ state, setState, today }) {
       </div>
 
       {selectedDay && <DayDetailSheet date={selectedDay} state={state} setState={setState} onClose={() => setSelectedDay(null)} />}
+      {swapOpen && (
+        <SwapSheet state={state} setState={setState} today={today}
+          fromWeekKey={ymd(weekStart)} fromMemberId={state.myMemberId}
+          onClose={() => setSwapOpen(false)} />
+      )}
     </div>
   );
 }
@@ -1271,10 +1665,14 @@ function WeekView({ state, setState, today }) {
 // ─────────────────────────────────────────────────────────────────────
 function PlanningView({ state, setState, today }) {
   const [memberId, setMemberId] = useState(state.myMemberId || state.members[0]?.id || "");
+  const [absMode, setAbsMode] = useState("range"); // 'range' | 'weekly'
   const [fromDate, setFromDate] = useState(ymd(today));
   const [toDate, setToDate] = useState(ymd(today));
+  const [untilDate, setUntilDate] = useState(ymd(new Date(today.getFullYear(), 11, 31)));
+  const [weekdays, setWeekdays] = useState([]); // 1=Mo … 5=Fr
   const [absenceType, setAbsenceType] = useState("vacation");
   const [selectedDay, setSelectedDay] = useState(null);
+  const [swapWeekKey, setSwapWeekKey] = useState(null);
 
   // Nicht-Admins dürfen nur die eigene Abwesenheit eintragen.
   const lockToSelf = !state.isAdmin && Boolean(state.myMemberId);
@@ -1291,18 +1689,34 @@ function PlanningView({ state, setState, today }) {
     }
   }, [state.members, lockToSelf, state.myMemberId]);
 
+  function toggleWeekday(n) {
+    setWeekdays((w) => (w.includes(n) ? w.filter((x) => x !== n) : [...w, n].sort()));
+  }
+
   function applyAbsence() {
-    if (!effMemberId || !fromDate || !toDate) return;
+    if (!effMemberId) return;
     const next = { ...state, trips: { ...state.trips } };
-    let d = parseYmd(fromDate);
-    const end = parseYmd(toDate);
-    while (d <= end) {
+    const writeDay = (d) => {
+      if (!isCommuteDay(d)) return; // nur Pendeltage (kein WE / Feiertag)
       const k = ymd(d);
       const t = { ...(next.trips[k] || { attendance: {} }) };
       t.attendance = { ...(t.attendance || {}) };
       t.attendance[effMemberId] = absenceType;
       next.trips[k] = t;
-      d = addDays(d, 1);
+    };
+    if (absMode === "weekly") {
+      if (weekdays.length === 0 || !fromDate || !untilDate) return;
+      let d = parseYmd(fromDate);
+      const end = parseYmd(untilDate);
+      while (d <= end) {
+        if (weekdays.includes(d.getDay())) writeDay(d);
+        d = addDays(d, 1);
+      }
+    } else {
+      if (!fromDate || !toDate) return;
+      let d = parseYmd(fromDate);
+      const end = parseYmd(toDate);
+      while (d <= end) { writeDay(d); d = addDays(d, 1); }
     }
     setState(next);
   }
@@ -1321,29 +1735,39 @@ function PlanningView({ state, setState, today }) {
       const date = parseYmd(dateKey);
       if (date < now) return;
       Object.entries(trip.attendance || {}).forEach(([mid, status]) => {
-        if (status === "sick" || status === "vacation") {
+        if (status === "sick" || status === "vacation" || status === "off") {
           result.push({ date, dateKey, memberId: mid, status });
         }
       });
     });
     result.sort((a, b) => a.date - b.date);
-    // Gruppieren nach Mitglied + Status + zusammenhängende Tage
+    // Gruppieren: zusammenhängender Zeitraum (nächster Pendeltag) ODER
+    // wiederkehrend (gleicher Wochentag, 7 Tage Abstand).
+    const isContig = (last, entry) => {
+      let x = addDays(last.endDate, 1);
+      while (!isCommuteDay(x)) x = addDays(x, 1);
+      return ymd(x) === entry.dateKey;
+    };
+    const isWeekly = (last, entry) => {
+      const gap = Math.round((entry.date - last.endDate) / 86400000);
+      return gap === 7 && entry.date.getDay() === last.startDate.getDay();
+    };
     const grouped = [];
     result.forEach((entry) => {
       const last = grouped[grouped.length - 1];
-      if (
-        last && last.memberId === entry.memberId && last.status === entry.status &&
-        Math.abs(addDays(last.endDate, 1) - entry.date) < 86400000 / 2
-      ) {
-        last.endDate = entry.date;
-        last.dateKeys.push(entry.dateKey);
-      } else {
-        grouped.push({
-          memberId: entry.memberId, status: entry.status,
-          startDate: entry.date, endDate: entry.date,
-          dateKeys: [entry.dateKey],
-        });
+      if (last && last.memberId === entry.memberId && last.status === entry.status) {
+        if ((last.kind === "range" || last.kind === "single") && isContig(last, entry)) {
+          last.endDate = entry.date; last.dateKeys.push(entry.dateKey); last.kind = "range"; return;
+        }
+        if ((last.kind === "weekly" || last.kind === "single") && isWeekly(last, entry)) {
+          last.endDate = entry.date; last.dateKeys.push(entry.dateKey); last.kind = "weekly"; return;
+        }
       }
+      grouped.push({
+        memberId: entry.memberId, status: entry.status,
+        startDate: entry.date, endDate: entry.date,
+        dateKeys: [entry.dateKey], kind: "single",
+      });
     });
     return grouped;
   }, [state.trips, today]);
@@ -1374,8 +1798,10 @@ function PlanningView({ state, setState, today }) {
         <Card style={{ padding: 24, textAlign: "center", color: C.textDim }}>Lege zuerst Mitglieder an.</Card>
       ) : (
         <>
+          <SwapRequestsList state={state} setState={setState} />
+
           {/* Abwesenheit eintragen */}
-          <SectionLabel>Urlaub oder Krankheit eintragen</SectionLabel>
+          <SectionLabel>Abwesenheit eintragen · Urlaub · Krank · Frei</SectionLabel>
           <Card style={{ padding: 16, marginBottom: 24 }}>
             <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Wer?</label>
             <select
@@ -1395,54 +1821,85 @@ function PlanningView({ state, setState, today }) {
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
-              <div>
-                <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Von</label>
-                <input type="date" value={fromDate} onChange={(e) => { setFromDate(e.target.value); if (e.target.value > toDate) setToDate(e.target.value); }}
+            {/* Modus: Zeitraum oder Wiederkehrend */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+              {[["range", "Zeitraum"], ["weekly", "Wiederkehrend"]].map(([m, label]) => (
+                <button key={m} onClick={() => setAbsMode(m)}
                   style={{
-                    width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-                    padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14,
-                    outline: "none", colorScheme: "dark",
+                    flex: 1, padding: "9px 12px", borderRadius: 10,
+                    background: absMode === m ? `${C.amber}18` : "transparent",
+                    border: `1px solid ${absMode === m ? C.amber : C.border}`,
+                    color: absMode === m ? C.amber : C.textDim,
+                    fontFamily: FONT_BODY, fontSize: 13, fontWeight: 600, cursor: "pointer",
                   }}
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Bis</label>
-                <input type="date" value={toDate} min={fromDate} onChange={(e) => setToDate(e.target.value)}
-                  style={{
-                    width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-                    padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14,
-                    outline: "none", colorScheme: "dark",
-                  }}
-                />
-              </div>
+                >{label}</button>
+              ))}
             </div>
+
+            {absMode === "range" ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                <div>
+                  <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Von</label>
+                  <input type="date" value={fromDate} onChange={(e) => { setFromDate(e.target.value); if (e.target.value > toDate) setToDate(e.target.value); }}
+                    style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14, outline: "none", colorScheme: "dark" }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Bis</label>
+                  <input type="date" value={toDate} min={fromDate} onChange={(e) => setToDate(e.target.value)}
+                    style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14, outline: "none", colorScheme: "dark" }} />
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>An welchen Tagen?</label>
+                <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                  {[[1, "Mo"], [2, "Di"], [3, "Mi"], [4, "Do"], [5, "Fr"]].map(([n, label]) => {
+                    const on = weekdays.includes(n);
+                    return (
+                      <button key={n} onClick={() => toggleWeekday(n)}
+                        style={{
+                          flex: 1, padding: "9px 0", borderRadius: 8,
+                          background: on ? `${C.amber}22` : "transparent",
+                          border: `1px solid ${on ? C.amber : C.border}`,
+                          color: on ? C.amber : C.textDim,
+                          fontFamily: FONT_BODY, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                        }}
+                      >{label}</button>
+                    );
+                  })}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <div>
+                    <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Ab</label>
+                    <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)}
+                      style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14, outline: "none", colorScheme: "dark" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 12, color: C.textDim, display: "block", marginBottom: 6 }}>Bis</label>
+                    <input type="date" value={untilDate} min={fromDate} onChange={(e) => setUntilDate(e.target.value)}
+                      style={{ width: "100%", background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", color: C.text, fontFamily: FONT_MONO, fontSize: 14, outline: "none", colorScheme: "dark" }} />
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
               <button onClick={() => setAbsenceType("vacation")}
-                style={{
-                  flex: 1, padding: "10px 12px", borderRadius: 10,
-                  background: absenceType === "vacation" ? `${C.green}22` : "transparent",
-                  border: `1px solid ${absenceType === "vacation" ? C.green : C.border}`,
-                  color: absenceType === "vacation" ? C.green : C.textDim,
-                  fontFamily: FONT_BODY, fontSize: 14, fontWeight: 600, cursor: "pointer",
-                  display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
-                }}
+                style={{ flex: 1, padding: "10px 8px", borderRadius: 10, background: absenceType === "vacation" ? `${C.green}22` : "transparent", border: `1px solid ${absenceType === "vacation" ? C.green : C.border}`, color: absenceType === "vacation" ? C.green : C.textDim, fontFamily: FONT_BODY, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }}
               ><Plane size={14} />Urlaub</button>
               <button onClick={() => setAbsenceType("sick")}
-                style={{
-                  flex: 1, padding: "10px 12px", borderRadius: 10,
-                  background: absenceType === "sick" ? `${C.red}22` : "transparent",
-                  border: `1px solid ${absenceType === "sick" ? C.red : C.border}`,
-                  color: absenceType === "sick" ? C.red : C.textDim,
-                  fontFamily: FONT_BODY, fontSize: 14, fontWeight: 600, cursor: "pointer",
-                  display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
-                }}
+                style={{ flex: 1, padding: "10px 8px", borderRadius: 10, background: absenceType === "sick" ? `${C.red}22` : "transparent", border: `1px solid ${absenceType === "sick" ? C.red : C.border}`, color: absenceType === "sick" ? C.red : C.textDim, fontFamily: FONT_BODY, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }}
               ><Thermometer size={14} />Krank</button>
+              <button onClick={() => setAbsenceType("off")}
+                style={{ flex: 1, padding: "10px 8px", borderRadius: 10, background: absenceType === "off" ? `${C.blue}22` : "transparent", border: `1px solid ${absenceType === "off" ? C.blue : C.border}`, color: absenceType === "off" ? C.blue : C.textDim, fontFamily: FONT_BODY, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+              ><Clock size={14} />Frei</button>
             </div>
 
-            <Btn variant="primary" onClick={applyAbsence} style={{ width: "100%", justifyContent: "center" }}>
-              <CalendarPlus size={14} />Abwesenheit eintragen
+            <Btn variant="primary" onClick={applyAbsence}
+              disabled={absMode === "weekly" && weekdays.length === 0}
+              style={{ width: "100%", justifyContent: "center" }}>
+              <CalendarPlus size={14} />
+              {absMode === "weekly" ? "Wiederkehrend eintragen" : "Abwesenheit eintragen"}
             </Btn>
           </Card>
 
@@ -1467,6 +1924,15 @@ function PlanningView({ state, setState, today }) {
                       <Avatar member={wDriverObj} size={28} />
                       <div style={{ fontSize: 13, color: C.text, fontWeight: 600 }}>{wDriverObj.name.split(" ")[0]}</div>
                     </div>
+                  )}
+                  {wd && wd.id === state.myMemberId && (
+                    <button onClick={() => setSwapWeekKey(ymd(wkStart))}
+                      style={{
+                        background: C.surface2, border: `1px solid ${C.border}`, color: C.textDim,
+                        borderRadius: 8, padding: "5px 9px", cursor: "pointer", fontSize: 11,
+                        fontFamily: FONT_BODY, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 4,
+                      }}
+                    ><ArrowRight size={12} />Tauschen</button>
                   )}
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 4 }}>
@@ -1527,6 +1993,16 @@ function PlanningView({ state, setState, today }) {
                   const m = state.members.find((x) => x.id === g.memberId);
                   if (!m) return null;
                   const sameDay = g.startDate.getTime() === g.endDate.getTime();
+                  const statusLabel = g.status === "sick"
+                    ? <span style={{ color: C.red }}>krank</span>
+                    : g.status === "off"
+                    ? <span style={{ color: C.blue }}>frei</span>
+                    : <span style={{ color: C.green }}>Urlaub</span>;
+                  const dateText = g.kind === "weekly"
+                    ? `jeden ${DAYS_DE_LONG[g.startDate.getDay()]} · bis ${formatDateShort(g.endDate)}`
+                    : sameDay
+                    ? formatDateShort(g.startDate)
+                    : `${formatDateShort(g.startDate)} → ${formatDateShort(g.endDate)}`;
                   return (
                     <div key={i} style={{
                       padding: "12px 12px",
@@ -1536,14 +2012,13 @@ function PlanningView({ state, setState, today }) {
                       <Avatar member={m} size={32} />
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontSize: 14, color: C.text, fontWeight: 600 }}>
-                          {m.name} · {g.status === "sick"
-                            ? <span style={{ color: C.red }}>krank</span>
-                            : <span style={{ color: C.green }}>Urlaub</span>}
+                          {m.name} · {statusLabel}
+                          {g.kind === "weekly" && (
+                            <span style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.amber, border: `1px solid ${C.amberDim}`, padding: "1px 5px", borderRadius: 3, letterSpacing: "0.08em", marginLeft: 6 }}>WIEDERKEHREND</span>
+                          )}
                         </div>
                         <div style={{ fontSize: 12, color: C.textDim, fontFamily: FONT_MONO }}>
-                          {sameDay ? formatDateShort(g.startDate)
-                            : `${formatDateShort(g.startDate)} → ${formatDateShort(g.endDate)}`}
-                          {" · "}{g.dateKeys.length} Tag{g.dateKeys.length > 1 ? "e" : ""}
+                          {dateText}{" · "}{g.dateKeys.length} Tag{g.dateKeys.length > 1 ? "e" : ""}
                         </div>
                       </div>
                       <button onClick={() => removeAbsence(g)}
@@ -1559,6 +2034,11 @@ function PlanningView({ state, setState, today }) {
       )}
 
       {selectedDay && <DayDetailSheet date={selectedDay} state={state} setState={setState} onClose={() => setSelectedDay(null)} />}
+      {swapWeekKey && (
+        <SwapSheet state={state} setState={setState} today={today}
+          fromWeekKey={swapWeekKey} fromMemberId={state.myMemberId}
+          onClose={() => setSwapWeekKey(null)} />
+      )}
     </div>
   );
 }
@@ -2527,6 +3007,7 @@ export default function App() {
             // Backfill defaults
             if (!remote.kmPerTrip) remote.kmPerTrip = 30;
             if (!remote.weeklyAssignments) remote.weeklyAssignments = {};
+            if (!remote.swapRequests) remote.swapRequests = [];
             _setGroupState(remote);
           }
         }
@@ -2581,7 +3062,7 @@ export default function App() {
   // setState — routet Änderungen an local oder shared
   const setState = useCallback((next) => {
     const localKeys = ["myMemberId", "notificationsEnabled", "groupCode"];
-    const groupKeys = ["members", "trips", "weeklyAssignments", "kmPerTrip", "adminMemberId"];
+    const groupKeys = ["members", "trips", "weeklyAssignments", "swapRequests", "kmPerTrip", "adminMemberId"];
 
     let localChanged = false;
     let groupChanged = false;
@@ -2652,6 +3133,7 @@ export default function App() {
     if (!remote) return { error: "Gruppe mit diesem Code nicht gefunden" };
     if (!remote.kmPerTrip) remote.kmPerTrip = 30;
     if (!remote.weeklyAssignments) remote.weeklyAssignments = {};
+    if (!remote.swapRequests) remote.swapRequests = [];
     const newLocal = { ...localState, groupCode: code, myMemberId: null };
     _setGroupState(remote);
     _setLocalState(newLocal);
