@@ -639,6 +639,45 @@ function explainWeekDriver(state, weekStart, wd) {
   return `${prefix}Bisher am seltensten gefahren: ${myCount} Woche${myCount === 1 ? "" : "n"} – das ist ${devTxt} dem fairen Schnitt von ${avg.toFixed(1)}. Deshalb als Nächste·r dran.`;
 }
 
+// Für eine MANUELL gesetzte Woche: wen hätte die App fair vorgeschlagen
+// (ohne den Eingriff) und was bewirkt die Übersteuerung? Liefert null, wenn
+// die Woche nicht manuell ist. Rein lesend (arbeitet auf einem Klon).
+function manualWeekImpact(state, weekStart) {
+  const wkKey = ymd(weekStart);
+  const manualId = state.weeklyAssignments?.[wkKey];
+  if (!manualId) return null;
+  const manual = state.members.find((m) => m.id === manualId) || null;
+
+  // Fairer Vorschlag = was die Rotation OHNE diese manuelle Zuweisung (und ohne
+  // die ggf. schon geloggten Fahrer·innen dieser Woche) wählen würde.
+  const weeklyAssignments = { ...(state.weeklyAssignments || {}) };
+  delete weeklyAssignments[wkKey];
+  const trips = { ...state.trips };
+  for (let i = 0; i < 5; i++) {
+    const dk = ymd(addDays(weekStart, i));
+    if (trips[dk]?.driverId) {
+      const t = { ...trips[dk] };
+      delete t.driverId; delete t.solo;
+      trips[dk] = t;
+    }
+  }
+  const fairWd = getWeekDriver({ ...state, weeklyAssignments, trips }, weekStart);
+  const fair = fairWd ? (state.members.find((m) => m.id === fairWd.id) || null) : null;
+  const sameAsFair = Boolean(fair && manual) && fair.id === manual.id;
+
+  // Wie steht die fair vorgeschlagene Person zum Schnitt (Kontext)?
+  const counts = weekDriverCounts(state, weekStart);
+  const total = state.members.reduce((a, m) => a + (counts[m.id] || 0), 0);
+  const avg = state.members.length ? total / state.members.length : 0;
+  let fairDevText = "";
+  if (fair) {
+    const dev = (counts[fair.id] || 0) - avg;
+    fairDevText = dev < -0.05 ? `${Math.abs(dev).toFixed(1)} unter dem Schnitt`
+      : dev > 0.05 ? `${dev.toFixed(1)} über dem Schnitt` : "genau auf dem Schnitt";
+  }
+  return { manual, fair, sameAsFair, fairDevText };
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // LOGIK: VORAUSSCHAU / IMPACT ("Was passiert, wenn ich fahre?")
 // ─────────────────────────────────────────────────────────────────────
@@ -2086,6 +2125,7 @@ function PlanningView({ state, setState, today }) {
             const wd = getWeekDriver(state, wkStart);
             const wDriverObj = wd ? state.members.find((m) => m.id === wd.id) : null;
             const reason = explainWeekDriver(state, wkStart, wd);
+            const manualImp = wd && wd.source === "manual" ? manualWeekImpact(state, wkStart) : null;
             return (
               <Card key={ymd(wkStart)} style={{ padding: 14, marginBottom: 10 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
@@ -2144,7 +2184,32 @@ function PlanningView({ state, setState, today }) {
                     );
                   })}
                 </div>
-                {wDriverObj && reason && (
+                {wDriverObj && manualImp ? (
+                  <div style={{
+                    marginTop: 10, padding: "9px 11px", borderRadius: 8,
+                    background: `${C.amber}0c`, border: `1px solid ${C.amber}33`,
+                    display: "flex", gap: 8, alignItems: "flex-start",
+                  }}>
+                    <RotateCcw size={13} color={C.amber} style={{ marginTop: 2, flexShrink: 0 }} />
+                    <div style={{ fontSize: 11.5, color: C.textDim, lineHeight: 1.45 }}>
+                      <span style={{ color: C.amber, fontWeight: 600 }}>Manuell: {manualImp.manual?.name.split(" ")[0]}</span>
+                      {manualImp.sameAsFair ? (
+                        <span> · deckt sich mit dem App-Vorschlag</span>
+                      ) : manualImp.fair ? (
+                        <> · <span style={{ color: C.blue, fontWeight: 600 }}>App-Vorschlag wäre {manualImp.fair.name.split(" ")[0]}</span></>
+                      ) : null}
+                      <div style={{ marginTop: 4 }}>
+                        {manualImp.sameAsFair ? (
+                          "Kein Nachteil für die anderen — die manuelle Wahl entspricht der fairen Rotation."
+                        ) : manualImp.fair ? (
+                          <>Überschreibt die faire Rotation: <span style={{ color: C.text }}>{manualImp.manual?.name.split(" ")[0]}</span> fährt statt <span style={{ color: C.text }}>{manualImp.fair.name.split(" ")[0]}</span> ({manualImp.fairDevText}). Dadurch fährt {manualImp.manual?.name.split(" ")[0]} 1× mehr als nötig, {manualImp.fair.name.split(" ")[0]} rückt nach hinten und kommt erst später dran.</>
+                        ) : (
+                          "Manuell festgelegt – überschreibt die faire Rotation."
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : wDriverObj && reason ? (
                   <div style={{
                     marginTop: 10, padding: "9px 11px", borderRadius: 8,
                     background: `${C.blue}0c`, border: `1px solid ${C.blue}22`,
@@ -2156,7 +2221,7 @@ function PlanningView({ state, setState, today }) {
                       {reason}
                     </div>
                   </div>
-                )}
+                ) : null}
               </Card>
             );
           })}
