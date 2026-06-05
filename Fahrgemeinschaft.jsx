@@ -56,6 +56,11 @@ const FONT_MONO = `"JetBrains Mono", "SF Mono", Consolas, monospace`;
 
 const PALETTE = ["#f5a524", "#7dd3fc", "#86efac", "#fb7185", "#c4b5fd", "#fde68a", "#fca5a5", "#a7f3d0"];
 
+// Durchschnittlicher CO₂-Ausstoß eines Pkw, in KILOGRAMM pro Kilometer.
+// 0.12 kg/km = 120 g/km (Flottenmittel). Das Ergebnis ist damit bereits in kg —
+// nicht zusätzlich durch 1000 teilen!
+const CO2_KG_PER_KM = 0.12;
+
 // ─────────────────────────────────────────────────────────────────────
 // DATES
 // ─────────────────────────────────────────────────────────────────────
@@ -635,6 +640,96 @@ function explainWeekDriver(state, weekStart, wd) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// LOGIK: VORAUSSCHAU / IMPACT ("Was passiert, wenn ich fahre?")
+// ─────────────────────────────────────────────────────────────────────
+// Simuliert die kommenden Wochen mit DERSELBEN Logik wie getWeekDriver
+// (pickWinner + Projektion) und liefert die·den Fahrer·in je Woche.
+// Reine Feiertagswochen werden übersprungen. Rein lesend – ändert nichts.
+function projectDriverTimeline(state, fromWeekStart, weeks) {
+  const counts = {};
+  const driverWeeks = {};
+  state.members.forEach((m) => { counts[m.id] = 0; driverWeeks[m.id] = new Set(); });
+  Object.entries(state.trips).forEach(([date, trip]) => {
+    if (trip.driverId && !trip.solo && driverWeeks[trip.driverId]) {
+      driverWeeks[trip.driverId].add(ymd(startOfWeek(parseYmd(date))));
+    }
+  });
+  state.members.forEach((m) => { counts[m.id] = driverWeeks[m.id].size; });
+
+  const timeline = [];
+  let cursor = new Date(fromWeekStart);
+  for (let w = 0; w < weeks; w++) {
+    const cKey = ymd(cursor);
+    const commuteDays = [0, 1, 2, 3, 4].map((i) => addDays(cursor, i)).filter(isCommuteDay);
+    if (commuteDays.length === 0) { cursor = addDays(cursor, 7); continue; } // reine Feiertagswoche
+
+    let driverId = null;
+    if (state.weeklyAssignments?.[cKey]) {
+      driverId = state.weeklyAssignments[cKey];
+    } else {
+      for (let i = 0; i < 5; i++) {
+        const d = addDays(cursor, i);
+        if (!isCommuteDay(d)) continue;
+        const trip = state.trips[ymd(d)];
+        if (trip?.driverId && !trip.solo) { driverId = trip.driverId; break; }
+      }
+      if (!driverId) { const win = pickWinner(state, cursor, counts); if (win) driverId = win.id; }
+    }
+    if (driverId && !driverWeeks[driverId]?.has(cKey)) {
+      counts[driverId] = (counts[driverId] || 0) + 1;
+      driverWeeks[driverId]?.add(cKey);
+    }
+    timeline.push({ weekStart: new Date(cursor), weekKey: cKey, driverId, iso: isoWeek(cursor) });
+    cursor = addDays(cursor, 7);
+  }
+  return timeline;
+}
+
+// Liefert die persönliche Auswirkung für EINE Person: aktueller Stand
+// (Abweichung vom fairen Schnitt, in Wochen), ob sie diese Woche dran ist,
+// und wann ihr nächster Einsatz wäre. Basis ist die wochenbasierte Zählung –
+// konsistent mit Planung/WhyPanel.
+function driverImpact(state, today, memberId) {
+  if (!memberId || state.members.length === 0) return null;
+  const N = state.members.length;
+  const weekStart = startOfWeek(today);
+
+  const counts = weekDriverCounts(state, weekStart);
+  const total = state.members.reduce((a, m) => a + (counts[m.id] || 0), 0);
+  const fair = N ? total / N : 0;
+  const myCount = counts[memberId] || 0;
+  const devNow = myCount - fair;
+  // Wenn ich diese Woche fahre: mein Zähler +1 und der Gesamtschnitt steigt mit.
+  const devAfter = (myCount + 1) - (total + 1) / N;
+
+  const wd = getWeekDriver(state, weekStart);
+  const iAmThisWeek = Boolean(wd) && wd.id === memberId;
+  const thisWeekDriver = wd ? state.members.find((m) => m.id === wd.id) : null;
+
+  const timeline = projectDriverTimeline(state, weekStart, 26);
+  const myWeeks = timeline.filter((t) => t.driverId === memberId);
+  const futureMine = myWeeks.filter((t) => t.weekStart.getTime() > weekStart.getTime());
+  // "Danach frei bis": der nächste Einsatz NACH dieser Woche, sonst der nächste überhaupt.
+  const nextMine = iAmThisWeek ? (futureMine[0] || null) : (myWeeks[0] || null);
+
+  return { N, fair, myCount, devNow, devAfter, iAmThisWeek, thisWeekDriver, nextMine };
+}
+
+// Baut die Nudge-Nachricht für die·den angemeldete·n Nutzer·in – aber nur,
+// wenn sie·er an einem Pendeltag tatsächlich diese Woche dran ist.
+function buildDriveNudge(state, today) {
+  if (!state.myMemberId || !isCommuteDay(today)) return null;
+  const imp = driverImpact(state, today, state.myMemberId);
+  if (!imp || !imp.iAmThisWeek) return null;
+  const me = state.members.find((m) => m.id === state.myMemberId);
+  const next = imp.nextMine ? ` Danach frei bis KW ${imp.nextMine.iso}.` : "";
+  return {
+    title: "🚗 Du bist diese Woche dran",
+    body: `${me?.name?.split(" ")[0] || "Du"}, übernimm die Woche — fair gerechnet.${next} Einfach fahren, passt.`,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // UI: Avatar, Card, Button
 // ─────────────────────────────────────────────────────────────────────
 function Avatar({ member, size = 36 }) {
@@ -958,6 +1053,83 @@ function DayDetailSheet({ date, state, setState, onClose }) {
 // ─────────────────────────────────────────────────────────────────────
 // VIEW: HEUTE
 // ─────────────────────────────────────────────────────────────────────
+// Formatiert eine Abweichung in Wochen: +0.7 / −0.3 / ±0.0
+function fmtDev(d) {
+  const sign = d > 0.05 ? "+" : d < -0.05 ? "−" : "±";
+  return `${sign}${Math.abs(d).toFixed(1)}`;
+}
+
+// Zeigt der·dem gerade angemeldeten Nutzer·in direkt beim Öffnen, wie sie·er
+// gerade steht und was eine Fahrt bewirkt – sachlich begründet statt "vertrau einfach".
+function ForecastCard({ state, today }) {
+  const me = state.myMemberId ? state.members.find((m) => m.id === state.myMemberId) : null;
+  const todayKey = ymd(today);
+  const imp = useMemo(() => (me ? driverImpact(state, today, me.id) : null), [state, todayKey, me?.id]);
+  if (!me || !imp) return null;
+
+  const nextTxt = imp.nextMine
+    ? `KW ${imp.nextMine.iso} · ${formatDateShort(imp.nextMine.weekStart)}`
+    : "kein Einsatz in Sicht";
+  const devColor = (d) => (d < -0.05 ? C.green : d > 0.05 ? C.amber : C.textDim);
+
+  if (imp.iAmThisWeek) {
+    return (
+      <Card style={{
+        padding: 16, marginBottom: 12, borderColor: C.amber,
+        background: `linear-gradient(135deg, ${C.amber}1e, ${C.amber}06)`,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 10, background: `${C.amber}22`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <Car size={18} color={C.amber} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ color: C.amber, fontWeight: 700, fontSize: 15 }}>Du bist diese Woche dran</div>
+            <div style={{ color: C.textDim, fontSize: 12 }}>Eine Woche fahren — danach hast du frei.</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "stretch", gap: 8, marginBottom: 12 }}>
+          <div style={{ flex: 1, background: C.bg2, borderRadius: 10, padding: "8px 10px" }}>
+            <div style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.textFaint, letterSpacing: "0.08em", marginBottom: 4 }}>STAND JETZT</div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 18, color: devColor(imp.devNow) }}>{fmtDev(imp.devNow)}</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", color: C.textFaint }}><ArrowRight size={16} /></div>
+          <div style={{ flex: 1, background: C.bg2, borderRadius: 10, padding: "8px 10px" }}>
+            <div style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.textFaint, letterSpacing: "0.08em", marginBottom: 4 }}>NACH DER WOCHE</div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 18, color: devColor(imp.devAfter) }}>{fmtDev(imp.devAfter)}</div>
+          </div>
+          <div style={{ flex: 1.3, background: C.bg2, borderRadius: 10, padding: "8px 10px" }}>
+            <div style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.textFaint, letterSpacing: "0.08em", marginBottom: 4 }}>DANACH FREI BIS</div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 13, color: C.blue, lineHeight: 1.2, marginTop: 3 }}>{nextTxt}</div>
+          </div>
+        </div>
+
+        <div style={{ fontSize: 12.5, color: C.text, lineHeight: 1.5, background: `${C.amber}10`, border: `1px solid ${C.amberDim}`, borderRadius: 10, padding: "10px 12px" }}>
+          Passt so — die App hat fair gerechnet. Übernimm die Woche, dann bist du wieder vorn. 🚗
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <Card style={{ padding: 16, marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ width: 34, height: 34, borderRadius: 10, background: `${C.blue}18`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <CalendarDays size={18} color={C.blue} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>
+            {imp.thisWeekDriver ? `Diese Woche fährt ${imp.thisWeekDriver.name.split(" ")[0]} — du hast frei` : "Diese Woche fährt niemand"}
+          </div>
+          <div style={{ color: C.textDim, fontSize: 12.5, marginTop: 2 }}>
+            Du bist als Nächstes dran: <span style={{ color: C.blue }}>{nextTxt}</span> · Stand {fmtDev(imp.devNow)}
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function TodayView({ state, setState, today, onTabChange }) {
   const todayKey = ymd(today);
   const trip = state.trips[todayKey] || { attendance: {} };
@@ -1079,6 +1251,8 @@ function TodayView({ state, setState, today, onTabChange }) {
         </Card>
       ) : (
         <>
+          <ForecastCard state={state} today={today} />
+
           {iAmDriving && !trip.driverId && (
             <Card style={{
               padding: 14, marginBottom: 12, borderColor: C.amber,
@@ -1282,7 +1456,10 @@ function WhyPanel({ state, weekStart }) {
             <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.5, marginBottom: 14 }}>{reason}</div>
           )}
 
-          <SectionLabel style={{ marginBottom: 8 }}>Gefahrene Wochen · fairer Schnitt {fair.toFixed(1)}</SectionLabel>
+          <SectionLabel style={{ marginBottom: 2 }}>Gefahrene Wochen · fairer Schnitt {fair.toFixed(1)}</SectionLabel>
+          <div style={{ fontSize: 10.5, color: C.textFaint, marginBottom: 10, lineHeight: 1.4 }}>
+            In Wochen gezählt — der Schnitt steigt mit jeder geplanten Woche.
+          </div>
           {ranked.map((m) => {
             const c = counts[m.id] || 0;
             const dev = c - fair;
@@ -2070,7 +2247,24 @@ function StatsView({ state }) {
         });
       }
     });
-    return { counts, rode, sick, vacation, solo, soloTrips };
+
+    // Abwesenheits-gewichteter fairer Anteil: jeder gefahrene Gruppentag wird nur
+    // unter den an DEM Tag Anwesenden aufgeteilt. Wer krank/Urlaub war, bekommt für
+    // diesen Tag keine Fahrpflicht angerechnet. Summe = Anzahl Gruppen-Fahrtage.
+    const personalFair = {};
+    state.members.forEach((m) => { personalFair[m.id] = 0; });
+    Object.values(state.trips).forEach((trip) => {
+      if (!trip.driverId || trip.solo) return; // nur echte Gruppen-Fahrtage
+      const avail = state.members.filter((m) => {
+        const s = trip.attendance?.[m.id];
+        return s !== "sick" && s !== "vacation" && s !== "off" && s !== "solo";
+      });
+      if (avail.length === 0) return;
+      const share = 1 / avail.length;
+      avail.forEach((m) => { personalFair[m.id] += share; });
+    });
+
+    return { counts, rode, sick, vacation, solo, soloTrips, personalFair };
   }, [state]);
 
   const totalTrips = Object.values(stats.counts).reduce((a, b) => a + b, 0);
@@ -2080,9 +2274,15 @@ function StatsView({ state }) {
   const soloKm = stats.soloTrips * kmPer;
   // CO2: nur gemeinschaftliche Fahrten sparen etwas (jede:r Mitfahrende spart eine eigene Fahrt).
   // Solo-Fahrten transportieren niemanden zusätzlich → kein CO2-Vorteil.
-  const co2Saved = totalKm * Math.max(0, state.members.length - 1) * 0.12;
+  // Ergebnis ist bereits in KILOGRAMM (CO2_KG_PER_KM ist kg/km) – nicht durch 1000 teilen.
+  const co2SavedKg = totalKm * Math.max(0, state.members.length - 1) * CO2_KG_PER_KM;
+  const co2Display = co2SavedKg >= 1000
+    ? { value: (co2SavedKg / 1000).toLocaleString("de-DE", { maximumFractionDigits: 1 }), suffix: "t" }
+    : { value: Math.round(co2SavedKg).toLocaleString("de-DE"), suffix: "kg" };
   const max = Math.max(1, ...Object.values(stats.counts));
   const ranked = [...state.members].sort((a, b) => (stats.counts[a.id] || 0) - (stats.counts[b.id] || 0));
+  // Wer ist als Nächstes dran – aus der echten Rotations-Engine (konsistent mit Heute/Planung).
+  const nextDriverId = state.members.length > 1 ? getWeekDriver(state, startOfWeek(new Date()))?.id : null;
 
   return (
     <div style={{ padding: "20px 18px 100px", maxWidth: 720, margin: "0 auto" }}>
@@ -2091,11 +2291,15 @@ function StatsView({ state }) {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
         <KpiCard label="Fahrten gesamt" value={totalTrips} suffix="Tage" accent={C.amber} />
-        <KpiCard label="Fairer Anteil" value={fairShare.toFixed(1)} suffix="je Person" accent={C.blue} />
-        <KpiCard label="Gefahrene Kilometer" value={totalKm.toLocaleString("de-DE")} suffix="km" accent={C.text} />
-        <KpiCard label="CO₂ eingespart" value={(co2Saved / 1000).toFixed(1)} suffix="kg" accent={C.green} />
+        <KpiCard label="Fairer Anteil" value={fairShare.toFixed(1)} suffix="je Person" accent={C.blue}
+          hint={`${totalTrips} Fahrten ÷ ${state.members.length} Personen = ${fairShare.toFixed(1)}. Das ist der ideale Schnitt, wenn alle immer da wären. Unten siehst du den persönlichen, anwesenheits­gewichteten Anteil. Hinweis: Die Statistik zählt einzelne Fahrtage, die Planung ganze Wochen — daher andere Zahlen.`} />
+        <KpiCard label="Gefahrene Kilometer" value={totalKm.toLocaleString("de-DE")} suffix="km" accent={C.text}
+          hint={`${totalTrips} Fahrten × ${kmPer} km je Fahrt = ${totalKm.toLocaleString("de-DE")} km. Die km je Fahrt stellst du unter „Mehr" ein.`} />
+        <KpiCard label="CO₂ eingespart" value={co2Display.value} suffix={co2Display.suffix} accent={C.green}
+          hint={`Schätzung: An jedem Gruppen-Fahrtag sparen sich ${Math.max(0, state.members.length - 1)} Mitfahrer·innen die eigene Fahrt. ${Math.max(0, state.members.length - 1)} × ${totalKm.toLocaleString("de-DE")} km × ${CO2_KG_PER_KM} kg/km ≈ ${Math.round(co2SavedKg).toLocaleString("de-DE")} kg.`} />
         {stats.soloTrips > 0 && (
-          <KpiCard label="Solo-Fahrten" value={stats.soloTrips} suffix={`Tage · ${soloKm.toLocaleString("de-DE")} km`} accent={C.textDim} />
+          <KpiCard label="Solo-Fahrten" value={stats.soloTrips} suffix={`Tage · ${soloKm.toLocaleString("de-DE")} km`} accent={C.textDim}
+            hint="Solo-Fahrten zählen nicht zur Fahrpflicht – sie nehmen niemandem aus der Gruppe eine Fahrt ab und senken deshalb keinen fairen Anteil." />
         )}
       </div>
 
@@ -2103,12 +2307,13 @@ function StatsView({ state }) {
         <Card style={{ padding: 24, textAlign: "center", color: C.textDim }}>Noch keine Mitglieder.</Card>
       ) : (
         <Card style={{ padding: 18 }}>
-          <SectionLabel>Verteilung · sortiert nach Reihe</SectionLabel>
+          <SectionLabel>Verteilung · fairer Anteil je Person</SectionLabel>
           {ranked.map((m, i) => {
             const c = stats.counts[m.id] || 0;
             const pct = (c / max) * 100;
-            const deviation = c - fairShare;
-            const isNext = i === 0 && state.members.length > 1;
+            const pf = stats.personalFair[m.id] || 0;
+            const deviation = c - pf;
+            const isNext = m.id === nextDriverId;
             return (
               <div key={m.id} style={{ marginBottom: i === ranked.length - 1 ? 0 : 16 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
@@ -2134,6 +2339,7 @@ function StatsView({ state }) {
                       fontSize: 10, fontFamily: FONT_MONO,
                       color: deviation > 0.5 ? C.amber : deviation < -0.5 ? C.green : C.textDim,
                     }}>{deviation > 0 ? "+" : ""}{deviation.toFixed(1)}</div>
+                    <div style={{ fontSize: 9, fontFamily: FONT_MONO, color: C.textFaint, marginTop: 1 }}>fair {pf.toFixed(1)}</div>
                   </div>
                 </div>
                 <div style={{ height: 6, background: C.bg2, borderRadius: 99, overflow: "hidden" }}>
@@ -2146,19 +2352,38 @@ function StatsView({ state }) {
               </div>
             );
           })}
+
+          <div style={{ fontSize: 11, color: C.textFaint, lineHeight: 1.5, marginTop: 14, paddingTop: 12, borderTop: `1px solid ${C.borderSoft}` }}>
+            <span style={{ color: C.textDim }}>Abweichung</span> = gefahrene Fahrten − dein fairer Anteil.
+            Der faire Anteil zählt nur Tage, an denen du da warst — <span style={{ color: C.green }}>Urlaub/Krank zählt nicht gegen dich</span>.
+            Grün = unter dem Schnitt (du bist eher dran), Amber = darüber.
+          </div>
         </Card>
       )}
     </div>
   );
 }
-function KpiCard({ label, value, suffix, accent }) {
+function KpiCard({ label, value, suffix, accent, hint }) {
+  const [showHint, setShowHint] = useState(false);
   return (
     <Card style={{ padding: 14 }}>
-      <SectionLabel style={{ fontSize: 10, marginBottom: 8 }}>{label}</SectionLabel>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 6 }}>
+        <SectionLabel style={{ fontSize: 10, marginBottom: 8 }}>{label}</SectionLabel>
+        {hint && (
+          <button onClick={() => setShowHint((s) => !s)} aria-label="Erklärung anzeigen" style={{
+            background: showHint ? `${C.blue}22` : "transparent", border: `1px solid ${showHint ? C.blue : C.border}`,
+            color: showHint ? C.blue : C.textFaint, width: 18, height: 18, borderRadius: "50%",
+            fontSize: 11, lineHeight: "16px", cursor: "pointer", fontFamily: FONT_MONO, padding: 0, flexShrink: 0,
+          }}>?</button>
+        )}
+      </div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
         <span style={{ fontFamily: FONT_DISPLAY, fontStyle: "italic", fontSize: 32, color: accent, lineHeight: 1, fontWeight: 400 }}>{value}</span>
         <span style={{ fontSize: 11, color: C.textDim, fontFamily: FONT_MONO }}>{suffix}</span>
       </div>
+      {hint && showHint && (
+        <div style={{ fontSize: 11, color: C.textDim, lineHeight: 1.45, marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.borderSoft}` }}>{hint}</div>
+      )}
     </Card>
   );
 }
@@ -3058,6 +3283,24 @@ export default function App() {
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [loaded, localState.groupCode, groupState.updatedAt]);
+
+  // Nudge beim Öffnen: wenn du diese Woche dran bist, eine freundliche
+  // Erinnerung — höchstens einmal pro Tag (per localStorage entprellt).
+  useEffect(() => {
+    if (!loaded || !state.notificationsEnabled) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const nudge = buildDriveNudge(state, today);
+    if (!nudge) return;
+    const key = `fg_nudge_${ymd(today)}`;
+    try {
+      if (localStorage.getItem(key)) return;
+      localStorage.setItem(key, "1");
+    } catch { /* localStorage nicht verfügbar → trotzdem zeigen */ }
+    try {
+      new Notification(nudge.title, { body: nudge.body, tag: "fg-drive-nudge" });
+    } catch { /* Notification fehlgeschlagen → still ignorieren */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, state.notificationsEnabled, state.myMemberId, groupState.updatedAt]);
 
   // setState — routet Änderungen an local oder shared
   const setState = useCallback((next) => {
