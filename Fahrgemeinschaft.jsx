@@ -196,6 +196,7 @@ const defaultGroup = {
   kmPerTrip: 30,
   updatedAt: 0,
   lastEditor: null,
+  lastChange: null,
   createdAt: new Date().toISOString(),
 };
 
@@ -698,17 +699,120 @@ function SectionLabel({ children, style }) {
   );
 }
 
-// Notiz: wer hat zuletzt etwas am gemeinsamen Plan geändert?
-// Quelle: groupState.lastEditor (Mitglied-ID) + groupState.updatedAt (Zeit),
-// die in setState() bei jeder geteilten Änderung gesetzt werden. So sieht jede·r
-// auf einen Blick, wer die letzte Änderung gemacht hat.
+// Lesbare Bezeichnungen der Tages-Status für die "Was wurde eingetragen"-Notiz.
+const ENTRY_STATUS_LABELS = {
+  sick: "Krank",
+  vacation: "Urlaub",
+  off: "Frei",
+  solo: "Solo",
+  rode: "Mitgefahren",
+  drove: "Gefahren",
+};
+
+// Beschreibt in einem kurzen deutschen Satzteil, WAS sich zwischen dem alten
+// (prev) und neuen (next) Gruppen-Stand geändert hat — z. B. "Urlaub für Max am
+// 12. Jun eingetragen". Rückgabe ohne führendes "hat", damit davor je nach
+// Person "Max hat …" oder "Du hast …" gesetzt werden kann. null = nichts Bekanntes.
+function describeChange(prev, next) {
+  const nameMap = new Map();
+  [...(prev.members || []), ...(next.members || [])].forEach((m) => {
+    if (m && !nameMap.has(m.id)) nameMap.set(m.id, m.name);
+  });
+  const nm = (id) => nameMap.get(id) || "ein Mitglied";
+  const dateLabel = (dk) => formatDateShort(parseYmd(dk));
+
+  // 1) Mitglieder hinzugefügt / entfernt
+  const pIds = (prev.members || []).map((m) => m.id);
+  const nIds = (next.members || []).map((m) => m.id);
+  const added = nIds.find((id) => !pIds.includes(id));
+  const removed = pIds.find((id) => !nIds.includes(id));
+  if (added) return `${nm(added)} als Mitglied hinzugefügt`;
+  if (removed) return `${nm(removed)} entfernt`;
+  if (JSON.stringify(prev.members || []) !== JSON.stringify(next.members || [])) {
+    return "die Mitglieder bearbeitet";
+  }
+
+  // 2) Wegstrecke
+  if ((prev.kmPerTrip || 0) !== (next.kmPerTrip || 0)) {
+    return `die Wegstrecke auf ${next.kmPerTrip} km geändert`;
+  }
+
+  // 3) Tausch-Anfragen
+  const ps = prev.swapRequests || [];
+  const ns = next.swapRequests || [];
+  if (JSON.stringify(ps) !== JSON.stringify(ns)) {
+    if (ns.length > ps.length) return "einen Tausch angefragt";
+    for (const n of ns) {
+      const p = ps.find((r) => r.id === n.id);
+      if (p && p.status !== n.status) {
+        if (n.status === "accepted") return "einen Tausch angenommen";
+        if (n.status === "declined") return "einen Tausch abgelehnt";
+        if (n.status === "cancelled") return "einen Tausch zurückgezogen";
+      }
+    }
+    return "eine Tausch-Anfrage aktualisiert";
+  }
+
+  // 4) Wochen-Rotation
+  const pw = prev.weeklyAssignments || {};
+  const nw = next.weeklyAssignments || {};
+  const wkKeys = [...new Set([...Object.keys(pw), ...Object.keys(nw)])].sort();
+  for (const wk of wkKeys) {
+    if (pw[wk] !== nw[wk]) {
+      const n = isoWeek(parseYmd(wk));
+      if (nw[wk]) return `${nm(nw[wk])} als Wochenfahrer für KW ${n} eingetragen`;
+      return `den Wochenfahrer für KW ${n} entfernt`;
+    }
+  }
+
+  // 5) Tages-Einträge (Fahrer / Anwesenheit)
+  const pt = prev.trips || {};
+  const nt = next.trips || {};
+  const dateKeys = [...new Set([...Object.keys(pt), ...Object.keys(nt)])].sort();
+  for (const dk of dateKeys) {
+    const a = pt[dk] || {};
+    const b = nt[dk] || {};
+    if ((a.driverId || null) !== (b.driverId || null)) {
+      if (b.driverId) return `${nm(b.driverId)} als Fahrer am ${dateLabel(dk)} eingetragen`;
+      return `den Fahrer am ${dateLabel(dk)} entfernt`;
+    }
+    const aa = a.attendance || {};
+    const ba = b.attendance || {};
+    const mids = [...new Set([...Object.keys(aa), ...Object.keys(ba)])];
+    for (const mid of mids) {
+      if (aa[mid] !== ba[mid]) {
+        if (ba[mid]) {
+          const label = ENTRY_STATUS_LABELS[ba[mid]] || ba[mid];
+          return `„${label}“ für ${nm(mid)} am ${dateLabel(dk)} eingetragen`;
+        }
+        return `den Eintrag für ${nm(mid)} am ${dateLabel(dk)} entfernt`;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Bündelt die Notiz-Daten "wer (Subjekt) hat/hast was (Prädikat) wann (when)".
+// Quelle: groupState.lastEditor / lastChange / updatedAt, gesetzt in setState().
+function lastEntryInfo(state) {
+  if (!state.updatedAt || (!state.lastEditor && !state.lastChange)) return null;
+  const editor = state.lastEditor ? (state.members || []).find((m) => m.id === state.lastEditor) : null;
+  const isMe = Boolean(state.lastEditor) && state.lastEditor === state.myMemberId;
+  return {
+    subject: isMe ? "Du" : (editor?.name || "Jemand"),
+    verb: isMe ? "hast" : "hat",
+    predicate: state.lastChange || "etwas geändert",
+    when: formatRelativeTime(state.updatedAt),
+  };
+}
+
+// Kompakte Notiz für den Header (eine Zeile, schneidet bei Bedarf ab) bzw.
+// ausführliche Variante als Karten-Fußzeile (z. B. in den Einstellungen).
 function LastEditNote({ state, style, compact = false }) {
-  if (!state.lastEditor || !state.updatedAt) return null;
-  const editor = state.members.find((m) => m.id === state.lastEditor);
-  const who = state.lastEditor === state.myMemberId
-    ? "dir"
-    : (editor?.name || "einem früheren Mitglied");
-  const when = formatRelativeTime(state.updatedAt);
+  const info = lastEntryInfo(state);
+  if (!info) return null;
+  const { subject, verb, predicate, when } = info;
 
   if (compact) {
     return (
@@ -717,7 +821,7 @@ function LastEditNote({ state, style, compact = false }) {
         color: C.textFaint, marginTop: 3, maxWidth: "100%",
         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", ...style,
       }}>
-        zuletzt geändert von {who} · {when}
+        zuletzt: {subject} {verb} {predicate} · {when}
       </div>
     );
   }
@@ -729,9 +833,32 @@ function LastEditNote({ state, style, compact = false }) {
     }}>
       <Clock size={13} color={C.textFaint} style={{ flexShrink: 0 }} />
       <span style={{ fontSize: 12, color: C.textDim, lineHeight: 1.4 }}>
-        Zuletzt geändert von{" "}
-        <span style={{ color: C.text, fontWeight: 600 }}>{who}</span>
-        {" · "}{when}
+        <span style={{ color: C.text, fontWeight: 600 }}>{subject}</span> {verb} {predicate}
+        <span style={{ color: C.textFaint }}> · {when}</span>
+      </span>
+    </div>
+  );
+}
+
+// Eigenständige Info-Leiste für Heute / Woche / Planung: "Wer hat was wann
+// zuletzt eingetragen?" als dezente Karte oben in der jeweiligen Ansicht.
+function LastEntryBar({ state, style }) {
+  const info = lastEntryInfo(state);
+  if (!info) return null;
+  const { subject, verb, predicate, when } = info;
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+      padding: "8px 12px", marginBottom: 16, ...style,
+    }}>
+      <Clock size={13} color={C.textFaint} style={{ flexShrink: 0 }} />
+      <span style={{
+        fontSize: 12, color: C.textDim, lineHeight: 1.4, minWidth: 0,
+        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+      }}>
+        <span style={{ color: C.text, fontWeight: 600 }}>{subject}</span> {verb} {predicate}
+        <span style={{ color: C.textFaint }}> · {when}</span>
       </span>
     </div>
   );
@@ -1154,6 +1281,8 @@ function TodayView({ state, setState, today, onTabChange }) {
       <div style={{ fontFamily: FONT_DISPLAY, fontSize: 28, color: C.text, lineHeight: 1.1, fontStyle: "italic", marginBottom: 24 }}>
         {formatDateLong(today)}
       </div>
+
+      <LastEntryBar state={state} />
 
       {state.members.length === 0 ? (
         <Card style={{ padding: 32, textAlign: "center" }}>
@@ -1647,6 +1776,8 @@ function WeekView({ state, setState, today }) {
         </div>
       </div>
 
+      <LastEntryBar state={state} />
+
       {weekDriverObj && (
         <>
           <Card style={{ padding: 16, display: "flex", alignItems: "center", gap: 14 }}>
@@ -1899,6 +2030,8 @@ function PlanningView({ state, setState, today }) {
     <div style={{ padding: "20px 18px 100px", maxWidth: 720, margin: "0 auto" }}>
       <SectionLabel style={{ marginBottom: 4 }}>Voraus planen</SectionLabel>
       <div style={{ fontFamily: FONT_DISPLAY, fontSize: 32, fontStyle: "italic", color: C.text, marginBottom: 24 }}>Planung</div>
+
+      <LastEntryBar state={state} />
 
       {state.members.length === 0 ? (
         <Card style={{ padding: 24, textAlign: "center", color: C.textDim }}>Lege zuerst Mitglieder an.</Card>
@@ -3212,8 +3345,8 @@ export default function App() {
       }
     });
 
-    // Berechtigungen erzwingen: wer nicht Admin ist, darf nur die eigenen
-    // Daten ändern. Alles andere wird auf den vorherigen Stand zurückgesetzt.
+    // Alle Mitglieder sind gleichberechtigt — enforcePermissions() lässt jede
+    // Änderung durch (siehe Funktionsdefinition oben).
     if (groupChanged) {
       newGroup = enforcePermissions(groupState, newGroup, newLocal.myMemberId);
       // Falls die Bereinigung alles zurückgedreht hat: kein echter Change.
@@ -3229,6 +3362,9 @@ export default function App() {
     if (groupChanged) {
       newGroup.updatedAt = Date.now();
       newGroup.lastEditor = newLocal.myMemberId;
+      // Kurze Beschreibung, WAS sich geändert hat (für die "Zuletzt
+      // eingetragen"-Notiz in Heute / Woche / Planung).
+      newGroup.lastChange = describeChange(groupState, newGroup);
       _setGroupState(newGroup);
       if (newLocal.groupCode) {
         setSyncStatus("syncing");
