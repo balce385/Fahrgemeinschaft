@@ -96,6 +96,21 @@ const isWorkday = (d) => {
 };
 const formatDateLong = (d) => `${DAYS_DE_LONG[d.getDay()]}, ${d.getDate()}. ${MONTHS_DE[d.getMonth()]}`;
 const formatDateShort = (d) => `${d.getDate()}. ${MONTHS_DE[d.getMonth()].slice(0, 3)}`;
+// Relative Zeitangabe ("gerade eben", "vor 5 Min.", "vor 2 Std.", …) für die
+// Notiz, wer zuletzt etwas am gemeinsamen Plan geändert hat.
+function formatRelativeTime(ts) {
+  if (!ts) return "";
+  const diff = Date.now() - ts;
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return "gerade eben";
+  if (min < 60) return `vor ${min} Min.`;
+  const hrs = Math.floor(min / 60);
+  if (hrs < 24) return `vor ${hrs} Std.`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return days === 1 ? "vor 1 Tag" : `vor ${days} Tagen`;
+  const d = new Date(ts);
+  return `am ${d.getDate()}. ${MONTHS_DE[d.getMonth()].slice(0, 3)}`;
+}
 
 function isoWeek(date) {
   const d = new Date(date);
@@ -179,7 +194,6 @@ const defaultGroup = {
   weeklyAssignments: {},
   swapRequests: [],
   kmPerTrip: 30,
-  adminMemberId: null,
   updatedAt: 0,
   lastEditor: null,
   createdAt: new Date().toISOString(),
@@ -258,178 +272,15 @@ function isAvailableOn(state, date, memberId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// LOGIK: BERECHTIGUNGEN (Admin + "jede·r nur eigene Daten")
+// LOGIK: BERECHTIGUNGEN — alle Mitglieder sind gleichberechtigt
 // ─────────────────────────────────────────────────────────────────────
-// Wer ist Admin? Explizit gesetzt, sonst das erste Mitglied (damit
-// Bestands-Gruppen nicht ausgesperrt werden und die·der Ersteller·in,
-// die·der das erste Mitglied anlegt, automatisch Admin wird).
-function effectiveAdminId(group) {
-  return group?.adminMemberId || group?.members?.[0]?.id || null;
-}
-function isAdminUser(group, myMemberId) {
-  return Boolean(myMemberId) && myMemberId === effectiveAdminId(group);
-}
-
-// Tausch-Anfragen (mitglieder-getrieben) sicher abgleichen.
-// Erlaubte Aktionen eines Mitglieds (me) in EINEM Schreibvorgang:
-//   • Anfrage anlegen: fromMemberId === me, status "pending" (keine Wochen-Änderung).
-//   • eigene offene Anfrage zurückziehen: pending → "cancelled".
-//   • an mich gerichtete Anfrage (toMemberId === me): pending → "declined" ODER
-//     pending → "accepted"; nur beim ANNEHMEN werden GENAU die beiden in der Anfrage
-//     benannten Wochen in weeklyAssignments getauscht.
-//   • eigene erledigte Anfragen (cancelled/declined/accepted) entfernen (aufräumen).
-// Eine Woche kann nur getauscht werden, wenn sie der jeweiligen Person aktuell
-// auch wirklich gehört (getWeekDriver). Alles andere wird auf den alten Stand
-// zurückgesetzt → kein unbefugtes Umbuchen fremder Wochen.
-function reconcileSwaps(prevGroup, nextGroup, me) {
-  const prevReqs = Array.isArray(prevGroup.swapRequests) ? prevGroup.swapRequests : [];
-  const nextReqs = Array.isArray(nextGroup.swapRequests) ? nextGroup.swapRequests : [];
-  const memberIds = new Set((prevGroup.members || []).map((m) => m.id));
-  const isWeekKey = (k) => typeof k === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k);
-  const ownsWeek = (mid, weekKey) => {
-    if (!isWeekKey(weekKey)) return false;
-    const wd = getWeekDriver(prevGroup, parseYmd(weekKey));
-    return Boolean(wd) && wd.id === mid;
-  };
-
-  const prevById = new Map(prevReqs.map((r) => [r.id, r]));
-  const nextById = new Map(nextReqs.map((r) => [r.id, r]));
-
-  const out = prevReqs.map((r) => ({ ...r })); // Basis = alter Stand
-  const outById = new Map(out.map((r) => [r.id, r]));
-  const weeklyAssignments = { ...(prevGroup.weeklyAssignments || {}) };
-
-  // 1) Neue Anfragen (in next, nicht in prev)
-  nextReqs.forEach((r) => {
-    if (!r || prevById.has(r.id)) return;
-    const valid =
-      r.status === "pending" &&
-      r.fromMemberId === me &&
-      memberIds.has(r.toMemberId) && r.toMemberId !== me &&
-      ownsWeek(me, r.fromWeekKey) &&
-      (r.toWeekKey == null || (isWeekKey(r.toWeekKey) && ownsWeek(r.toMemberId, r.toWeekKey)));
-    if (valid) {
-      out.push({
-        id: String(r.id),
-        fromMemberId: me,
-        fromWeekKey: r.fromWeekKey,
-        toMemberId: r.toMemberId,
-        toWeekKey: r.toWeekKey == null ? null : r.toWeekKey,
-        status: "pending",
-        createdAt: r.createdAt || Date.now(),
-      });
-    }
-  });
-
-  // 2) Entfernte Anfragen: nur erledigte, an denen me beteiligt ist (aufräumen)
-  prevReqs.forEach((p) => {
-    if (nextById.has(p.id)) return;
-    const involved = p.fromMemberId === me || p.toMemberId === me;
-    if (involved && p.status !== "pending") {
-      const idx = out.findIndex((r) => r.id === p.id);
-      if (idx >= 0) out.splice(idx, 1);
-    }
-  });
-
-  // 3) Status-Übergänge (id in prev und next)
-  prevReqs.forEach((p) => {
-    const n = nextById.get(p.id);
-    if (!n || n.status === p.status) return;
-    if (p.status !== "pending") return; // aus erledigt heraus: nichts erlaubt
-    const target = outById.get(p.id);
-    if (!target) return;
-    if (n.status === "cancelled" && p.fromMemberId === me) {
-      target.status = "cancelled";
-    } else if (n.status === "declined" && p.toMemberId === me) {
-      target.status = "declined";
-    } else if (n.status === "accepted" && p.toMemberId === me) {
-      if (
-        ownsWeek(p.fromMemberId, p.fromWeekKey) &&
-        (p.toWeekKey == null || ownsWeek(p.toMemberId, p.toWeekKey))
-      ) {
-        target.status = "accepted";
-        weeklyAssignments[p.fromWeekKey] = p.toMemberId;
-        if (p.toWeekKey != null) weeklyAssignments[p.toWeekKey] = p.fromMemberId;
-      }
-    }
-  });
-
-  return { swapRequests: out, weeklyAssignments };
-}
-
-// Felder, die nur der·die Admin ändern darf:
-//   members, weeklyAssignments, kmPerTrip, adminMemberId,
-//   sowie pro Tag: driverId / solo / fremde Anwesenheiten.
-// Ein normales Mitglied darf ausschliesslich die EIGENE Anwesenheit
-// (krank / Urlaub / mitgefahren / solo) an einem Tag setzen.
-// Diese Funktion baut aus dem alten Stand + den gewuenschten Aenderungen
-// einen "bereinigten" neuen Stand: alles, was das Mitglied nicht aendern
-// darf, wird auf den alten Stand zurueckgesetzt. So bleibt der Plan auch
-// dann geschuetzt, wenn irgendwo in der UI ein Knopf vergessen wurde.
+// Es gibt keine Rollen (kein Admin) mehr — jede·r darf den gesamten
+// gemeinsamen Plan ändern (Mitglieder, Rotation, Fahrer, Kilometer und
+// alle Anwesenheiten). Diese Funktion lässt daher jede Änderung unverändert
+// durch und existiert nur noch, damit der bestehende Aufruf in setState()
+// bestehen bleibt.
 function enforcePermissions(prevGroup, nextGroup, myMemberId) {
-  // Admin (oder Ersteinrichtung ohne Mitglieder) darf alles.
-  if (isAdminUser(nextGroup, myMemberId) || (prevGroup.members?.length || 0) === 0) {
-    return nextGroup;
-  }
-  // Kein eigenes Mitglied gewaehlt -> gar keine geteilten Aenderungen erlaubt.
-  if (!myMemberId) {
-    return {
-      ...nextGroup,
-      members: prevGroup.members,
-      weeklyAssignments: prevGroup.weeklyAssignments,
-      swapRequests: prevGroup.swapRequests || [],
-      kmPerTrip: prevGroup.kmPerTrip,
-      adminMemberId: prevGroup.adminMemberId,
-      trips: prevGroup.trips,
-    };
-  }
-
-  // Tausch-Anfragen + die daraus erlaubten Wochen-Zuweisungen sicher abgleichen.
-  const swap = reconcileSwaps(prevGroup, nextGroup, myMemberId);
-
-  // Geschuetzte Felder unveraendert uebernehmen (weeklyAssignments nur via Tausch).
-  const result = {
-    ...nextGroup,
-    members: prevGroup.members,
-    weeklyAssignments: swap.weeklyAssignments,
-    swapRequests: swap.swapRequests,
-    kmPerTrip: prevGroup.kmPerTrip,
-    adminMemberId: prevGroup.adminMemberId,
-  };
-
-  // Trips bereinigen: alter Stand ist die Basis, nur die EIGENE
-  // Anwesenheit des Mitglieds wird aus dem gewuenschten Stand uebernommen.
-  const prevTrips = prevGroup.trips || {};
-  const nextTrips = nextGroup.trips || {};
-  const trips = {};
-  const allDates = new Set([...Object.keys(prevTrips), ...Object.keys(nextTrips)]);
-
-  allDates.forEach((dateKey) => {
-    const prevTrip = prevTrips[dateKey];
-    const nextTrip = nextTrips[dateKey];
-    // Basis = alter Trip (driverId/solo/fremde Anwesenheit unangetastet).
-    const base = prevTrip
-      ? { ...prevTrip, attendance: { ...(prevTrip.attendance || {}) } }
-      : { attendance: {} };
-
-    // Gewuenschter eigener Status an diesem Tag.
-    const desiredOwn = nextTrip?.attendance?.[myMemberId];
-    if (desiredOwn === undefined) {
-      // "drove" duerfen Mitglieder NICHT fuer sich selbst setzen (das macht
-      // der·die Admin ueber die Fahrer-Auswahl). Eigenen Status entfernen.
-      if (base.attendance[myMemberId] && base.attendance[myMemberId] !== "drove") {
-        delete base.attendance[myMemberId];
-      }
-    } else if (desiredOwn !== "drove") {
-      base.attendance[myMemberId] = desiredOwn;
-    }
-
-    const hasContent = base.driverId || Object.keys(base.attendance).length > 0;
-    if (hasContent) trips[dateKey] = base;
-  });
-
-  result.trips = trips;
-  return result;
+  return nextGroup;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -844,6 +695,45 @@ function SectionLabel({ children, style }) {
       fontFamily: FONT_MONO, fontSize: 11, letterSpacing: "0.18em",
       color: C.textFaint, textTransform: "uppercase", marginBottom: 10, ...style,
     }}>{children}</div>
+  );
+}
+
+// Notiz: wer hat zuletzt etwas am gemeinsamen Plan geändert?
+// Quelle: groupState.lastEditor (Mitglied-ID) + groupState.updatedAt (Zeit),
+// die in setState() bei jeder geteilten Änderung gesetzt werden. So sieht jede·r
+// auf einen Blick, wer die letzte Änderung gemacht hat.
+function LastEditNote({ state, style, compact = false }) {
+  if (!state.lastEditor || !state.updatedAt) return null;
+  const editor = state.members.find((m) => m.id === state.lastEditor);
+  const who = state.lastEditor === state.myMemberId
+    ? "dir"
+    : (editor?.name || "einem früheren Mitglied");
+  const when = formatRelativeTime(state.updatedAt);
+
+  if (compact) {
+    return (
+      <div style={{
+        fontFamily: FONT_MONO, fontSize: 9, letterSpacing: "0.08em",
+        color: C.textFaint, marginTop: 3, maxWidth: "100%",
+        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", ...style,
+      }}>
+        zuletzt geändert von {who} · {when}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.borderSoft}`, ...style,
+    }}>
+      <Clock size={13} color={C.textFaint} style={{ flexShrink: 0 }} />
+      <span style={{ fontSize: 12, color: C.textDim, lineHeight: 1.4 }}>
+        Zuletzt geändert von{" "}
+        <span style={{ color: C.text, fontWeight: 600 }}>{who}</span>
+        {" · "}{when}
+      </span>
+    </div>
   );
 }
 
@@ -2467,27 +2357,22 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
 
   function addMember() {
     if (!newName.trim()) return;
-    if (state.members.length > 0 && !state.isAdmin) return; // nur Admin darf Mitglieder anlegen
     const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const color = PALETTE[state.members.length % PALETTE.length];
     const next = { ...state, members: [...state.members, { id, name: newName.trim(), color }] };
-    // Erstes Mitglied: wird Admin und automatisch als "ich" gesetzt.
+    // Erstes Mitglied wird automatisch als "ich" gesetzt.
     if (state.members.length === 0) {
-      next.adminMemberId = id;
       next.myMemberId = id;
     }
     setState(next);
     setNewName("");
   }
   function removeMember(id) {
-    if (!state.isAdmin) return;
-    if (id === state.adminMemberId) return; // Admin-Mitglied nicht löschen
     const next = { ...state, members: state.members.filter((m) => m.id !== id) };
     if (state.myMemberId === id) next.myMemberId = null;
     setState(next);
   }
   function moveMember(idx, delta) {
-    if (!state.isAdmin) return;
     const next = [...state.members];
     const target = idx + delta;
     if (target < 0 || target >= next.length) return;
@@ -2513,12 +2398,7 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
     }
     setState({ ...state, myMemberId: next });
   }
-  function makeAdmin(id) {
-    if (!state.isAdmin) return;
-    setState({ ...state, adminMemberId: id });
-  }
   function updateKm(km) {
-    if (!state.isAdmin) return;
     setState({ ...state, kmPerTrip: km });
   }
 
@@ -2631,7 +2511,6 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
   }
 
   function resetAll() {
-    if (!state.isAdmin) return;
     setState({
       ...state,
       members: [],
@@ -2654,32 +2533,26 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
       <SectionLabel style={{ marginBottom: 4 }}>Konfiguration</SectionLabel>
       <div style={{ fontFamily: FONT_DISPLAY, fontSize: 32, fontStyle: "italic", color: C.text, marginBottom: 24 }}>Einstellungen</div>
 
-      {/* Rolle */}
-      <Card style={{
-        padding: 14, marginBottom: 16,
-        border: `1px solid ${state.isAdmin ? C.amberDim : C.border}`,
-        background: state.isAdmin ? `${C.amber}0c` : C.surface,
-      }}>
+      {/* Gleiche Rechte für alle + letzte Änderung */}
+      <Card style={{ padding: 14, marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{
             width: 34, height: 34, borderRadius: 9, flexShrink: 0,
             display: "flex", alignItems: "center", justifyContent: "center",
-            background: state.isAdmin ? `${C.amber}22` : C.surface2,
-            border: `1px solid ${state.isAdmin ? C.amber : C.border}`,
+            background: C.surface2, border: `1px solid ${C.border}`,
           }}>
-            {state.isAdmin ? <Sparkles size={16} color={C.amber} /> : <Users size={16} color={C.textDim} />}
+            <Users size={16} color={C.textDim} />
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 14, color: C.text, fontWeight: 600 }}>
-              {state.isAdmin ? "Du bist Admin" : "Du bist Mitglied"}
+              Gleiche Rechte für alle
             </div>
             <div style={{ fontSize: 12, color: C.textDim, lineHeight: 1.4 }}>
-              {state.isAdmin
-                ? "Du verwaltest Mitglieder, Rotation und alle Einträge."
-                : "Du kannst nur deine eigenen Einträge (Urlaub, Krankheit, mitgefahren) ändern."}
+              Jedes Mitglied kann Mitglieder, Rotation und alle Einträge bearbeiten.
             </div>
           </div>
         </div>
+        <LastEditNote state={state} />
       </Card>
 
       {/* Konto (nur Tier 2) */}
@@ -2749,9 +2622,7 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
       {/* Mitglieder */}
       <SectionLabel>Mitglieder ({state.members.length}) · Reihenfolge = Rotation</SectionLabel>
       <Card style={{ padding: 4, marginBottom: 16 }}>
-        {state.members.map((m, i) => {
-          const isMemberAdmin = m.id === state.adminMemberId;
-          return (
+        {state.members.map((m, i) => (
           <div key={m.id} style={{
             padding: "10px 12px",
             borderBottom: i < state.members.length - 1 ? `1px solid ${C.borderSoft}` : "none",
@@ -2765,44 +2636,24 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ color: C.text, fontSize: 15, fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
-                {isMemberAdmin && (
-                  <span style={{
-                    fontSize: 8, fontFamily: FONT_MONO, color: C.amber, flexShrink: 0,
-                    border: `1px solid ${C.amberDim}`, background: `${C.amber}11`,
-                    padding: "2px 5px", borderRadius: 4, letterSpacing: "0.1em",
-                  }}>ADMIN</span>
-                )}
               </div>
             </div>
-            {state.isAdmin && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                <button onClick={() => moveMember(i, -1)} disabled={i === 0}
-                  style={{
-                    background: "transparent", border: "none",
-                    color: i === 0 ? C.textFaint : C.textDim,
-                    cursor: i === 0 ? "default" : "pointer", padding: "2px 4px",
-                    display: "flex", alignItems: "center",
-                  }}><ChevronUp size={14} /></button>
-                <button onClick={() => moveMember(i, 1)} disabled={i === state.members.length - 1}
-                  style={{
-                    background: "transparent", border: "none",
-                    color: i === state.members.length - 1 ? C.textFaint : C.textDim,
-                    cursor: i === state.members.length - 1 ? "default" : "pointer", padding: "2px 4px",
-                    display: "flex", alignItems: "center",
-                  }}><ChevronDown size={14} /></button>
-              </div>
-            )}
-            {state.isAdmin && !isMemberAdmin && (
-              <button onClick={() => makeAdmin(m.id)} title="Zum Admin machen"
+            <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <button onClick={() => moveMember(i, -1)} disabled={i === 0}
                 style={{
-                  background: "transparent", border: `1px solid ${C.border}`,
-                  color: C.textDim, borderRadius: 8, padding: "4px 8px", cursor: "pointer",
+                  background: "transparent", border: "none",
+                  color: i === 0 ? C.textFaint : C.textDim,
+                  cursor: i === 0 ? "default" : "pointer", padding: "2px 4px",
                   display: "flex", alignItems: "center",
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = C.amber)}
-                onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
-              ><Sparkles size={14} /></button>
-            )}
+                }}><ChevronUp size={14} /></button>
+              <button onClick={() => moveMember(i, 1)} disabled={i === state.members.length - 1}
+                style={{
+                  background: "transparent", border: "none",
+                  color: i === state.members.length - 1 ? C.textFaint : C.textDim,
+                  cursor: i === state.members.length - 1 ? "default" : "pointer", padding: "2px 4px",
+                  display: "flex", alignItems: "center",
+                }}><ChevronDown size={14} /></button>
+            </div>
             <button onClick={() => setMe(m.id)}
               style={{
                 background: state.myMemberId === m.id ? `${C.amber}22` : "transparent",
@@ -2812,33 +2663,24 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
                 fontWeight: 600, cursor: "pointer", letterSpacing: "0.1em", flexShrink: 0,
               }}
             >{state.myMemberId === m.id ? "ICH ✓" : "ICH"}</button>
-            {state.isAdmin && !isMemberAdmin && (
-              <button onClick={() => removeMember(m.id)}
-                style={{ background: "transparent", border: "none", color: C.textDim, cursor: "pointer", padding: 6, borderRadius: 6 }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = C.red)}
-                onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
-              ><Trash2 size={16} /></button>
-            )}
+            <button onClick={() => removeMember(m.id)}
+              style={{ background: "transparent", border: "none", color: C.textDim, cursor: "pointer", padding: 6, borderRadius: 6 }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = C.red)}
+              onMouseLeave={(e) => (e.currentTarget.style.color = C.textDim)}
+            ><Trash2 size={16} /></button>
           </div>
-          );
-        })}
-        {(state.isAdmin || state.members.length === 0) ? (
-          <div style={{ padding: "10px 12px", display: "flex", gap: 8 }}>
-            <input type="text" placeholder="Name hinzufügen…" value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addMember()}
-              style={{
-                flex: 1, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-                padding: "10px 12px", color: C.text, fontFamily: FONT_BODY, fontSize: 14, outline: "none",
-              }}
-            />
-            <Btn variant="primary" onClick={addMember} disabled={!newName.trim()}><UserPlus size={16} /></Btn>
-          </div>
-        ) : (
-          <div style={{ padding: "10px 12px", fontSize: 12, color: C.textFaint, fontStyle: "italic" }}>
-            Nur der·die Admin kann Mitglieder verwalten.
-          </div>
-        )}
+        ))}
+        <div style={{ padding: "10px 12px", display: "flex", gap: 8 }}>
+          <input type="text" placeholder="Name hinzufügen…" value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addMember()}
+            style={{
+              flex: 1, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
+              padding: "10px 12px", color: C.text, fontFamily: FONT_BODY, fontSize: 14, outline: "none",
+            }}
+          />
+          <Btn variant="primary" onClick={addMember} disabled={!newName.trim()}><UserPlus size={16} /></Btn>
+        </div>
       </Card>
 
       {/* Wegstrecke */}
@@ -2846,13 +2688,12 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
       <Card style={{ padding: 16, marginBottom: 16 }}>
         <label style={{ fontSize: 13, color: C.textDim, display: "block", marginBottom: 8 }}>Kilometer pro Fahrt (Hin & zurück)</label>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <input type="number" min={1} value={state.kmPerTrip || 30} disabled={!state.isAdmin}
+          <input type="number" min={1} value={state.kmPerTrip || 30}
             onChange={(e) => updateKm(Number(e.target.value) || 0)}
             style={{
               width: 100, background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8,
-              padding: "10px 12px", color: state.isAdmin ? C.text : C.textFaint,
+              padding: "10px 12px", color: C.text,
               fontFamily: FONT_MONO, fontSize: 16, outline: "none",
-              opacity: state.isAdmin ? 1 : 0.6,
             }}
           />
           <span style={{ fontFamily: FONT_MONO, color: C.textDim, fontSize: 13 }}>km</span>
@@ -2914,7 +2755,7 @@ function SettingsView({ state, setState, today, onLeaveGroup, onClaimMember, aut
         <Btn onClick={exportJSON} style={{ width: "100%", marginBottom: 8, justifyContent: "center" }}>
           <Download size={14} />Daten als JSON exportieren
         </Btn>
-        {!state.isAdmin ? null : !showResetConfirm ? (
+        {!showResetConfirm ? (
           <Btn variant="danger" onClick={() => setShowResetConfirm(true)} style={{ width: "100%", justifyContent: "center" }}>
             <RotateCcw size={14} />Alle Daten zurücksetzen
           </Btn>
@@ -3229,33 +3070,14 @@ export default function App() {
   const today = new Date();
 
   // Merged state — was die Views erwarten
-  const [serverIsAdmin, setServerIsAdmin] = useState(false);
   const state = useMemo(() => ({
     ...groupState,
     myMemberId: localState.myMemberId,
     notificationsEnabled: localState.notificationsEnabled,
     groupCode: localState.groupCode,
-    adminMemberId: effectiveAdminId(groupState),
-    // Tier 1: lokale Heuristik (erstes Mitglied / adminMemberId).
-    // Tier 2: der Server entscheidet (Eigentümer der Gruppe).
-    isAdmin: requireLogin
-      ? serverIsAdmin
-      : isAdminUser(groupState, localState.myMemberId),
-  }), [localState, groupState, requireLogin, serverIsAdmin]);
-
-  // Tier 2: Admin-Status beim Server bestätigen lassen.
-  useEffect(() => {
-    if (!requireLogin || !window.storage?.auth || !localState.groupCode || !session) {
-      if (!requireLogin) return;
-      setServerIsAdmin(false);
-      return;
-    }
-    let cancelled = false;
-    window.storage.auth.isGroupAdmin(localState.groupCode).then((v) => {
-      if (!cancelled) setServerIsAdmin(!!v);
-    });
-    return () => { cancelled = true; };
-  }, [requireLogin, localState.groupCode, session, groupState.updatedAt]);
+    // Keine Rollen mehr: jedes Mitglied hat dieselben (vollen) Rechte.
+    isAdmin: true,
+  }), [localState, groupState]);
 
   // Erst-Laden + Migration
   useEffect(() => {
@@ -3370,7 +3192,7 @@ export default function App() {
   // setState — routet Änderungen an local oder shared
   const setState = useCallback((next) => {
     const localKeys = ["myMemberId", "notificationsEnabled", "groupCode"];
-    const groupKeys = ["members", "trips", "weeklyAssignments", "swapRequests", "kmPerTrip", "adminMemberId"];
+    const groupKeys = ["members", "trips", "weeklyAssignments", "swapRequests", "kmPerTrip"];
 
     let localChanged = false;
     let groupChanged = false;
@@ -3550,6 +3372,7 @@ export default function App() {
               <span style={{ color: C.textFaint, fontSize: 8 }}>·</span>
               <SyncIndicator status={syncStatus} lastSync={lastSync} />
             </div>
+            <LastEditNote state={state} compact />
           </div>
         </div>
       </header>
