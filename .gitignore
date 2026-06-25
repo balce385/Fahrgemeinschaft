@@ -16,3 +16,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# build/distribution artifacts
+*.zip
